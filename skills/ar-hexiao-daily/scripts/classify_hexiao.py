@@ -1502,8 +1502,8 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
                     f"若你指的那个 SOD 交付额比 {h:.2f} 大，就是只回了一部分——"
                     "实际未收必须按「智云最新交付额 − 累计实际回款」算，不能拿盈亏表旧应收减；"
                     "回款明细填实际回款，计提目标更新为最新交付额，同时保持拆行后的原始应收合计不变。"
-                    "按已确认规则，程序将尝试选择盈亏表中该 SO 的首个未结清 SOD；"
-                    "若该行不能安全承接则继续挂账。",
+                    "按已确认规则，程序将从盈亏表中该 SO 的首个未结清 SOD 开始顺序核销；"
+                    "当前 SOD 核满后余额继续进入下一个，最后不足的 SOD 按部分回款拆行。",
                     so=so,
                     default_first_sod=True,
                     default_amount_orig=float(h),
@@ -2107,55 +2107,6 @@ def classify_one(
     thr: float,
     year_now: int,
 ) -> dict:
-    if rec.get("default_first_sod") and ledger is not None and rec.get("so"):
-        so = str(rec.get("so") or "").strip()
-        first_row = next(
-            (
-                row_no
-                for row_no in sorted(ledger.so_index.get(so, []))
-                if ledger._is_outstanding(ledger.row_snapshot.get(row_no) or {})
-            ),
-            None,
-        )
-        if first_row is not None:
-            snap = ledger.row_snapshot.get(first_row) or {}
-            target_sod = str(snap.get("sod") or "").strip()
-            target_line = next(
-                (
-                    line
-                    for line in (rec.get("default_sod_lines") or [])
-                    if str(line.get("sod") or "").strip() == target_sod
-                ),
-                None,
-            )
-            if target_sod and target_line is not None and target_line.get("deliver_local") is not None:
-                resolved = dict(rec)
-                resolved.pop("forced_code", None)
-                resolved.pop("forced_reason", None)
-                resolved.pop("default_first_sod", None)
-                resolved.update({
-                    "sod": target_sod,
-                    "amount_orig": rec.get("default_amount_orig"),
-                    "amount_local": rec.get("default_amount_local"),
-                    "deliver_local": target_line.get("deliver_local"),
-                    "currency": target_line.get("currency") or rec.get("currency"),
-                    "cumulative_received_local": rec.get(
-                        "default_cumulative_received_local"
-                    ),
-                    "so_all_lines": rec.get("default_sod_lines") or [],
-                    "preferred_ledger_row": first_row,
-                    "match_basis": (
-                        f"{rec.get('default_match_basis') or '智云核销金额'}"
-                        "/同SO首个未结清SOD默认"
-                    ),
-                })
-                resolved_result = classify_one(resolved, ledger, rates, thr, year_now)
-                resolved_result["reason"] = (
-                    "按确认规则选择盈亏表中同 SO 的首个未结清 SOD。"
-                    + str(resolved_result.get("reason") or "")
-                )
-                return resolved_result
-
     result = {
         "ar": rec.get("ar") or "",
         "so": rec.get("so") or "",
@@ -2185,6 +2136,7 @@ def classify_one(
         "candidates": [],
         "warning_codes": list(rec.get("warning_codes") or []),
         "duplicate_writeoff_audit": rec.get("duplicate_writeoff_audit") or {},
+        "ambiguous_sod_waterfall": rec.get("ambiguous_sod_waterfall") or {},
         # 仅供同一 SO/SOD 的跨父 AR 分笔链复核；不得用这些字段跨 SO 或跨 SOD 合并。
         "split_payment_source": {
             "amount_local": common.to_number(rec.get("amount_local")),
@@ -2333,7 +2285,7 @@ def classify_one(
     so, sod = rec.get("so") or "", rec.get("sod") or ""
     preferred_row = rec.get("preferred_ledger_row")
     if preferred_row is not None:
-        row, how, cands = int(preferred_row), "同SO首个未结清SOD默认", []
+        row, how, cands = int(preferred_row), "同SO未结清SOD顺序核销", []
     else:
         row, how, cands = ledger.match(so, sod, amount_orig)
 
@@ -3127,6 +3079,175 @@ def _make_split_payment_chain(
     return operation, ""
 
 
+def _expand_ambiguous_sod_waterfall(
+    rec: dict,
+    ledger: Optional[LedgerIndex],
+    tolerance: float,
+) -> List[dict]:
+    """把无法唯一落到 SOD 的逐 SO 金额按盈亏未结清行顺序分配。"""
+    if not rec.get("default_first_sod") or ledger is None or not rec.get("so"):
+        return [rec]
+
+    so = str(rec.get("so") or "").strip()
+    total_local = common.to_number(rec.get("default_amount_local"))
+    total_orig = common.to_number(rec.get("default_amount_orig"))
+    if total_local is None:
+        total_local = total_orig
+    if total_local is None or float(total_local) <= tolerance:
+        failed = dict(rec)
+        failed.pop("default_first_sod", None)
+        failed["forced_code"] = "E5"
+        failed["forced_reason"] = "同 SO 多 SOD 顺序核销缺少可用的本次核销金额。"
+        return [failed]
+
+    line_by_sod = {
+        str(line.get("sod") or "").strip(): line
+        for line in (rec.get("default_sod_lines") or [])
+        if str(line.get("sod") or "").strip()
+    }
+    candidates: List[dict] = []
+    seen_sods = set()
+    for row_no in sorted(ledger.so_index.get(so, [])):
+        snap = ledger.row_snapshot.get(row_no) or {}
+        if not ledger._is_outstanding(snap):
+            continue
+        sod = str(snap.get("sod") or "").strip()
+        if not sod or sod in seen_sods:
+            continue
+        line = line_by_sod.get(sod)
+        delivery = common.to_number((line or {}).get("deliver_local"))
+        if line is None or delivery is None:
+            failed = dict(rec)
+            failed.pop("default_first_sod", None)
+            failed["forced_code"] = "E5"
+            failed["forced_reason"] = (
+                f"同 SO 多 SOD 顺序核销命中未结清 SOD {sod or '-'}，"
+                "但缺少对应的智云交付额，无法安全分配。"
+            )
+            return [failed]
+        initial_receivable, existing_received, business_rows = ledger.business_totals(
+            so, sod, row_no
+        )
+        if initial_receivable is None:
+            failed = dict(rec)
+            failed.pop("default_first_sod", None)
+            failed["forced_code"] = "E5"
+            failed["forced_reason"] = (
+                f"同 SO 多 SOD 顺序核销命中未结清 SOD {sod}，"
+                "但盈亏行缺少应收金额，无法验证拆分守恒。"
+            )
+            return [failed]
+        capacity = round(float(delivery) - float(existing_received), 2)
+        if capacity <= tolerance:
+            continue
+        candidates.append({
+            "row": int(row_no),
+            "sod": sod,
+            "line": line,
+            "delivery": round(float(delivery), 2),
+            "existing_received": round(float(existing_received), 2),
+            "capacity": capacity,
+            "business_rows": list(business_rows),
+        })
+        seen_sods.add(sod)
+
+    available = round(sum(item["capacity"] for item in candidates), 2)
+    if float(total_local) > available + tolerance:
+        failed = dict(rec)
+        failed.pop("default_first_sod", None)
+        failed["forced_code"] = "E4"
+        failed["forced_reason"] = (
+            f"同 SO 未结清 SOD 可承接金额合计 {available:.2f}，"
+            f"小于本次核销 {float(total_local):.2f}，剩余金额无法安全落表。"
+        )
+        return [failed]
+
+    remaining = round(float(total_local), 2)
+    allocations: List[dict] = []
+    for item in candidates:
+        if remaining <= tolerance:
+            break
+        allocated = round(min(remaining, item["capacity"]), 2)
+        if allocated <= tolerance:
+            continue
+        allocations.append({**item, "allocated_local": allocated})
+        remaining = round(remaining - allocated, 2)
+
+    if remaining > tolerance or not allocations:
+        failed = dict(rec)
+        failed.pop("default_first_sod", None)
+        failed["forced_code"] = "E5"
+        failed["forced_reason"] = "同 SO 多 SOD 顺序核销未形成完整、守恒的分配结果。"
+        return [failed]
+
+    total_orig_f = float(total_orig) if total_orig is not None else float(total_local)
+    total_local_f = float(total_local)
+    allocated_orig_running = 0.0
+    audit_rows = []
+    for index, item in enumerate(allocations):
+        if index == len(allocations) - 1:
+            allocated_orig = round(total_orig_f - allocated_orig_running, 2)
+        else:
+            allocated_orig = round(
+                item["allocated_local"] * total_orig_f / total_local_f, 2
+            )
+            allocated_orig_running = round(allocated_orig_running + allocated_orig, 2)
+        item["allocated_orig"] = allocated_orig
+        audit_rows.append({
+            "row": item["row"],
+            "sod": item["sod"],
+            "delivery_local": item["delivery"],
+            "existing_received_local": item["existing_received"],
+            "allocated_local": item["allocated_local"],
+            "remaining_after": round(
+                total_local_f - sum(x["allocated_local"] for x in allocations[: index + 1]),
+                2,
+            ),
+        })
+
+    expanded: List[dict] = []
+    for index, item in enumerate(allocations):
+        resolved = dict(rec)
+        for key in (
+            "forced_code", "forced_reason", "default_first_sod",
+            "default_amount_orig", "default_amount_local",
+            "default_cumulative_received_local", "default_sod_lines",
+            "default_match_basis",
+        ):
+            resolved.pop(key, None)
+        warnings = list(resolved.get("warning_codes") or [])
+        for warning in ("W_DEFAULT_FIRST_SOD", "W_AMBIGUOUS_SOD_WATERFALL"):
+            if warning not in warnings:
+                warnings.append(warning)
+        resolved.update({
+            "sod": item["sod"],
+            "amount_orig": item["allocated_orig"],
+            "amount_local": item["allocated_local"],
+            "deliver_local": item["delivery"],
+            "currency": item["line"].get("currency") or rec.get("currency"),
+            "cumulative_received_local": round(
+                item["existing_received"] + item["allocated_local"], 2
+            ),
+            "itemized_cumulative_authoritative": False,
+            "so_all_lines": rec.get("default_sod_lines") or [],
+            "preferred_ledger_row": item["row"],
+            "warning_codes": warnings,
+            "match_basis": (
+                f"{rec.get('default_match_basis') or '智云核销金额'}"
+                "/同SO未结清SOD按行顺序核销"
+            ),
+            "ambiguous_sod_waterfall": {
+                "rule": "ledger_open_sod_row_order_waterfall",
+                "total_local": round(total_local_f, 2),
+                "allocation_index": index,
+                "allocation_count": len(allocations),
+                "allocations": audit_rows,
+            },
+        })
+        expanded.append(resolved)
+    return expanded
+
+
 def classify_records(
     records: List[dict],
     ledger: Optional[LedgerIndex] = None,
@@ -3135,10 +3256,21 @@ def classify_records(
     rates = rates or {}
     thr = common.tail_threshold()
     year_now = common.current_year()
-    results = [
-        classify_one(rec, ledger, rates, thr, year_now)
-        for rec in records
-    ]
+    resolved_records: List[dict] = []
+    for rec in records:
+        resolved_records.extend(
+            _expand_ambiguous_sod_waterfall(rec, ledger, max(thr, TOL))
+        )
+    results = []
+    for rec in resolved_records:
+        result = classify_one(rec, ledger, rates, thr, year_now)
+        audit = rec.get("ambiguous_sod_waterfall") or {}
+        if audit:
+            result["reason"] = (
+                "同一 SO 的逐单金额无法唯一落到 SOD，已按盈亏未结清行顺序核销。"
+                + str(result.get("reason") or "")
+            )
+        results.append(result)
 
     # 同一 SO/SOD 被不同父 AR 依次核销时，通常保留每一笔父回款并建立连续拆行链。
     # 已有完整聚合结清行且小额父回款尾差合计不超过 1 元时，保留聚合行并幂等跳过。

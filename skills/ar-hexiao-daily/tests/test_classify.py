@@ -243,6 +243,127 @@ def test_sod_ambiguous_holds_e5():
     assert "SOD1" in recs[0]["forced_reason"]  # 候选要摆出来给她挑
 
 
+def test_sod_ambiguous_amount_over_first_waterfalls_to_next_open_sod():
+    """首个未结清 SOD 核满后，余额必须继续核销下一行，最后不足时拆行。"""
+    p = _pay(
+        amount=250.0,
+        orders=[{"so": "SO1", "deliver": 300.0}],
+        writeoffs={"SO1": 250.0},
+    )
+    p["sod_lines"] = {"SO1": [
+        {"sod": "SOD1", "deliver": 100.0},
+        {"sod": "SOD2", "deliver": 100.0},
+        {"sod": "SOD3", "deliver": 100.0},
+    ]}
+    recs = C.expand_payment(p, {})
+    led = _led({
+        10: {"so": "SO1", "sod": "SOD1", "yingshou": 100.0, "jiezhang": "否"},
+        11: {"so": "SO1", "sod": "SOD2", "yingshou": 100.0, "jiezhang": "否"},
+        12: {"so": "SO1", "sod": "SOD3", "yingshou": 100.0, "jiezhang": "否"},
+    })
+
+    result = C.classify_records(recs, led, {})
+
+    assert result["counts"] == {"auto": 3, "hold": 0, "exception": 0, "total": 3}
+    assert [(x["sod"], x["five_cols"]["回款明细"]) for x in result["auto"]] == [
+        ("SOD1", 100.0),
+        ("SOD2", 100.0),
+        ("SOD3", 50.0),
+    ]
+    assert result["auto"][0]["five_cols"]["计提"] == 100.0
+    assert result["auto"][1]["five_cols"]["计提"] == 100.0
+    assert result["auto"][2]["row_operation"]["type"] == "split_below"
+    assert result["auto"][2]["row_operation"]["unpaid_receivable"] == 50.0
+    assert all(
+        "W_AMBIGUOUS_SOD_WATERFALL" in x["warning_codes"]
+        for x in result["auto"]
+    )
+
+
+def test_sod_ambiguous_waterfall_skips_closed_sod():
+    """历史已结清 SOD 不占用本次金额，从首个未结清行开始。"""
+    p = _pay(
+        amount=150.0,
+        orders=[{"so": "SO1", "deliver": 300.0}],
+        writeoffs={"SO1": 150.0},
+    )
+    p["sod_lines"] = {"SO1": [
+        {"sod": "SOD1", "deliver": 100.0},
+        {"sod": "SOD2", "deliver": 100.0},
+        {"sod": "SOD3", "deliver": 100.0},
+    ]}
+    recs = C.expand_payment(p, {})
+    led = _led({
+        10: {"so": "SO1", "sod": "SOD1", "yingshou": 100.0, "huikuan": 100.0, "jiezhang": "是"},
+        11: {"so": "SO1", "sod": "SOD2", "yingshou": 100.0, "jiezhang": "否"},
+        12: {"so": "SO1", "sod": "SOD3", "yingshou": 100.0, "jiezhang": "否"},
+    })
+
+    result = C.classify_records(recs, led, {})
+
+    assert [(x["sod"], x["five_cols"]["回款明细"]) for x in result["auto"]] == [
+        ("SOD2", 100.0),
+        ("SOD3", 50.0),
+    ]
+
+
+def test_sod_ambiguous_waterfall_rejects_amount_over_all_open_capacity():
+    """全部未结清 SOD 都不够承接时整笔挂起，不允许只写前半段。"""
+    p = _pay(
+        amount=250.0,
+        orders=[{"so": "SO1", "deliver": 300.0}],
+        writeoffs={"SO1": 250.0},
+    )
+    p["sod_lines"] = {"SO1": [
+        {"sod": "SOD1", "deliver": 100.0},
+        {"sod": "SOD2", "deliver": 100.0},
+        {"sod": "SOD3", "deliver": 100.0},
+    ]}
+    recs = C.expand_payment(p, {})
+    led = _led({
+        10: {"so": "SO1", "sod": "SOD1", "yingshou": 100.0, "huikuan": 100.0, "jiezhang": "是"},
+        11: {"so": "SO1", "sod": "SOD2", "yingshou": 100.0, "jiezhang": "否"},
+        12: {"so": "SO1", "sod": "SOD3", "yingshou": 100.0, "jiezhang": "否"},
+    })
+
+    result = C.classify_records(recs, led, {})
+
+    assert result["counts"] == {"auto": 0, "hold": 0, "exception": 1, "total": 1}
+    assert result["exception"][0]["code"] == "E4"
+    assert "可承接金额合计 200.00" in result["exception"][0]["reason"]
+
+
+def test_sod_ambiguous_waterfall_regression_amount_exceeds_first_delivery():
+    """回归：12219.27 不得再直接与首个 SOD 的 4045.34 比较后报 E4。"""
+    p = _pay(
+        amount=12219.27,
+        orders=[{"so": "SO1", "deliver": 29765.91}],
+        writeoffs={"SO1": 12219.27},
+    )
+    p["sod_lines"] = {"SO1": [
+        {"sod": "SOD1", "deliver": 4045.34},
+        {"sod": "SOD2", "deliver": 5000.00},
+        {"sod": "SOD3", "deliver": 20720.57},
+    ]}
+    recs = C.expand_payment(p, {})
+    led = _led({
+        10: {"so": "SO1", "sod": "SOD1", "yingshou": 4045.34, "jiezhang": "否"},
+        11: {"so": "SO1", "sod": "SOD2", "yingshou": 5000.00, "jiezhang": "否"},
+        12: {"so": "SO1", "sod": "SOD3", "yingshou": 20720.57, "jiezhang": "否"},
+    })
+
+    result = C.classify_records(recs, led, {})
+
+    assert result["counts"]["exception"] == 0
+    assert result["counts"]["hold"] == 0
+    assert [(x["sod"], x["five_cols"]["回款明细"]) for x in result["auto"]] == [
+        ("SOD1", 4045.34),
+        ("SOD2", 5000.00),
+        ("SOD3", 3173.93),
+    ]
+    assert round(sum(x["five_cols"]["回款明细"] for x in result["auto"]), 2) == 12219.27
+
+
 def test_no_sod_falls_back_to_so():
     """订单明细查不到 SOD → 退化按 SO 匹配，仍然可判，不是丢单。"""
     p = _pay(amount=50.0, orders=[{"so": "SO1", "deliver": 50.0}])
