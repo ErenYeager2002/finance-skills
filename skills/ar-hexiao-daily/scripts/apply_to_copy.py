@@ -29,6 +29,7 @@ from typing import Dict, List
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import common  # noqa: E402
+import workbook_finalize  # noqa: E402
 from validate_plan import (  # noqa: E402
     DERIVED,
     FIVE,
@@ -592,9 +593,14 @@ def write_change_report(changes: List[dict], path: Path) -> None:
             + [ch.get("派生列_改后", {}).get(k, "") for k in DERIVED]
             + [ch.get("派生列_公式", {}).get(k, "") for k in DERIVED]
         )
+        # 变更清单只展示公式原文，不让报表自身参与计算。
+        for cell in ws[ws.max_row][-len(DERIVED):]:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.data_type = "s"
     ws.freeze_panes = "A2"
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
+    workbook_finalize.finalize_static_report(path)
 
 
 def _comparison_objects(items: List[dict]) -> List[dict]:
@@ -888,6 +894,7 @@ def write_order_difference_report(result: dict, path: Path) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
+    workbook_finalize.finalize_static_report(path)
 
 
 def _apply_new_file(

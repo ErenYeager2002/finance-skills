@@ -3,6 +3,7 @@
 步骤6 判定 v2（单入口 · SOD 级）：展开、E 码、覆盖率硬校验、SOD 子集与整段对齐。
 """
 import datetime as dt
+from pathlib import Path
 
 import pytest
 
@@ -821,12 +822,107 @@ def test_repeated_partial_only_counts_current_sod():
 
 
 def test_cross_year_only_after_ledger_miss():
-    """2025 的单**在表里有行**就正常填；只有表里找不到才判 E3。"""
+    """单表底层判定仍按传入的目标年度表定位。"""
     led = _led({1: {"so": "SO25120734", "sod": "", "yingshou": 52200.0}})
     r = C.classify_one(_rec("SO25120734", "SOD25121039", 52200.0), led, {}, 0.0, 2026)
     assert r["bucket"] == "auto", r
-    r2 = C.classify_one(_rec("SO25080089", "SOD25080128", 1.0), led, {}, 0.0, 2026)
+    r2 = C.classify_one(
+        _rec(
+            "SO25080089", "SOD25080128", 1.0,
+            delivery_date=dt.date(2025, 8, 1), target_ledger_year=2025,
+        ),
+        led, {}, 0.0, 2026,
+    )
     assert r2["code"] == "E3" and r2["bucket"] == "hold"
+
+
+def test_cross_year_routes_only_to_matching_annual_ledger():
+    current = _led({
+        10: {"so": "SO26010001", "sod": "SOD26010001", "yingshou": 100.0},
+        11: {"so": "SO25010001", "sod": "SOD25010001", "yingshou": 50.0},
+    })
+    prior = _led({
+        20: {"so": "SO25010001", "sod": "SOD25010001", "yingshou": 50.0},
+    })
+    result = C.classify_records_by_year(
+        [
+            _rec("SO26010001", "SOD26010001", 100.0, delivery_date=dt.date(2026, 1, 1)),
+            _rec("SO25010001", "SOD25010001", 50.0, delivery_date=dt.date(2025, 1, 1)),
+        ],
+        {2026: current, 2025: prior},
+        {},
+        {2026: Path("2026年盈亏.xlsx"), 2025: Path("2025年盈亏.xlsx")},
+    )
+    assert result["counts"] == {"auto": 2, "hold": 0, "exception": 0, "total": 2}
+    routed = {item["so"]: item for item in result["auto"]}
+    assert routed["SO26010001"]["ledger_year"] == 2026
+    assert routed["SO26010001"]["ledger_row_ref"] == 10
+    assert routed["SO25010001"]["ledger_year"] == 2025
+    assert routed["SO25010001"]["ledger_row_ref"] == 20
+
+
+def test_cross_year_missing_annual_ledger_holds_even_if_current_table_has_order():
+    current = _led({
+        11: {"so": "SO25010001", "sod": "SOD25010001", "yingshou": 50.0},
+    })
+    result = C.classify_records_by_year(
+        [_rec("SO25010001", "SOD25010001", 50.0, delivery_date=dt.date(2025, 1, 1))],
+        {2026: current},
+        {},
+        {2026: Path("2026年盈亏.xlsx")},
+    )
+    item = result["hold"][0]
+    assert item["code"] == "E3"
+    assert "没有提供 2025 年盈亏" in item["reason"]
+
+
+def test_cross_year_annual_ledger_missing_order_holds_e3():
+    prior = _led({
+        20: {"so": "SO25019999", "sod": "SOD25019999", "yingshou": 50.0},
+    })
+    result = C.classify_records_by_year(
+        [_rec("SO25010001", "SOD25010001", 50.0, delivery_date=dt.date(2025, 1, 1))],
+        {2025: prior},
+        {},
+        {2025: Path("2025年盈亏.xlsx")},
+    )
+    item = result["hold"][0]
+    assert item["code"] == "E3"
+    assert "已检查 2025 年盈亏表" in item["reason"]
+
+
+def test_delivery_year_uses_explicit_project_delivery_date_not_order_number():
+    prior = _led({
+        20: {"so": "SO24100160", "sod": "SOD24100238", "yingshou": 100.0},
+    })
+    result = C.classify_records_by_year(
+        [_rec(
+            "SO24100160", "SOD24100238", 100.0,
+            delivery_date=dt.date(2025, 8, 13),
+        )],
+        {2025: prior},
+        {},
+        {2025: Path("2025年盈亏.xlsx")},
+    )
+    item = result["auto"][0]
+    assert item["ledger_year"] == 2025
+    assert item["delivery_date"] == "2025-08-13"
+
+
+def test_missing_project_delivery_date_holds_without_number_inference():
+    result = C.classify_records_by_year(
+        [_rec(
+            "SO24100160", "SOD24100238", 100.0,
+            delivery_date=None,
+            delivery_date_issue="项目交付日期缺失：订单详情没有明确值",
+        )],
+        {2024: _led({20: {"so": "SO24100160", "sod": "SOD24100238", "yingshou": 100.0}})},
+        {},
+        {2024: Path("2024年盈亏.xlsx")},
+    )
+    item = result["hold"][0]
+    assert item["code"] == "E_DELIVERY_DATE_MISSING"
+    assert item["ledger_year"] is None
 
 
 def test_missing_so_is_e2():

@@ -17,6 +17,7 @@ import apply_flow as AF  # noqa: E402
 import apply_all as AA  # noqa: E402
 import apply_to_copy as AC  # noqa: E402
 import build_worklist as BW  # noqa: E402
+import workbook_finalize as WF  # noqa: E402
 
 
 def _sha(p: Path) -> str:
@@ -234,6 +235,42 @@ def test_apply_flow_skips_hand(tmp_path):
     rc = AF.main(["--plan", str(plan_p), "--workspace", str(ws), "--confirmed", "--in-place"])
     assert rc == 0
     assert _sha(flow_path) == before
+
+
+def test_apply_flow_idempotent_rerun_replaces_report_with_static_zero_change(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "02_我的表副本").mkdir(parents=True)
+    (ws / "04_产出").mkdir(parents=True)
+    flow_path = ws / "02_我的表副本" / "流转测.xlsx"
+    _flow_xlsx(flow_path, [("2026-08-10", "甲", 100, "SO1", "是", "汇")])
+    before = _sha(flow_path)
+    plan = {
+        "items": [{
+            "ar": "AR1", "verdict": "write", "file": "流转测.xlsx", "sheet": "明细",
+            "row_no": 2, "order_suggest": "SO1", "updated_suggest": "是",
+            "matched_by": "三键", "hits": 1,
+        }],
+        "counts": {"write": 1, "hand": 0, "skip": 0},
+    }
+    plan_p = ws / "04_产出" / "流转写入计划_校验后.json"
+    plan_p.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    report = ws / "04_产出" / "流转变更清单_20260810.xlsx"
+
+    rc = AF.main([
+        "--plan", str(plan_p), "--workspace", str(ws), "--in-place",
+        "--report", str(report),
+    ])
+
+    assert rc == 0
+    assert _sha(flow_path) == before
+    wb = openpyxl.load_workbook(str(report), read_only=True, data_only=True)
+    assert wb["流转变更清单"].max_row == 1
+    wb.close()
+    calc = WF.inspect_calculation(report)
+    assert calc.formula_cells == 0
+    assert calc.calc_chain_present is False
+    assert calc.full_calc_on_load in ("", "0")
+    assert calc.force_full_calc in ("", "0")
 
 
 def test_worklist_shows_flow_mk(tmp_path):

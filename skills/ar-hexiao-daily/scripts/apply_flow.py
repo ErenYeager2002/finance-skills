@@ -409,6 +409,10 @@ def write_change_report(changes: List[dict], path: Path) -> None:
         ws.append([ch.get(h) for h in headers])
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
+    wb.close()
+    import workbook_finalize
+
+    workbook_finalize.finalize_static_report(path)
 
 
 def main(argv=None) -> int:
@@ -431,18 +435,19 @@ def main(argv=None) -> int:
     plan = json.loads(plan_p.read_text(encoding="utf-8"))
     items = plan.get("items") or []
     writable = [it for it in items if it.get("verdict") == "write"]
-    if not writable:
-        print("流转无可自动写的笔（全是手填/跳过）。什么都没改。")
-        return 0
-
     ws = common.resolve_workspace(args.workspace)
-    changes, problems = write_flow_items(ws, items, in_place=args.in_place)
     report = Path(args.report) if args.report else (
         ws / "04_产出" / f"流转变更清单_{dt.date.today().strftime('%Y%m%d')}.xlsx"
     )
-    if changes:
-        write_change_report(changes, report)
+    if not writable:
+        write_change_report([], report)
+        print("流转无可自动写的笔（全是手填/跳过）。什么都没改。")
         print(f"流转变更清单 → {report}")
+        return 0
+
+    changes, problems = write_flow_items(ws, items, in_place=args.in_place)
+    write_change_report(changes, report)
+    print(f"流转变更清单 → {report}")
 
     if problems:
         print("⚠ 流转写入问题：", file=sys.stderr)

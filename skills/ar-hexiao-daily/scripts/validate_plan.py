@@ -1050,11 +1050,87 @@ def validate(
     return out
 
 
+def validate_by_year(
+    plan: dict,
+    rows_by_year: Dict[int, Dict[int, dict]],
+    ledger_paths: Optional[Dict[int, Path]] = None,
+) -> dict:
+    """分别校验各年度盈亏表，避免相同行号在不同年度之间被误判为冲突。"""
+    ledger_paths = ledger_paths or {}
+    grouped: Dict[int, List[dict]] = {}
+    missing_year_items: List[dict] = []
+    for item in plan.get("auto") or []:
+        if item.get("ledger_year") is None:
+            missing_year_items.append(item)
+            continue
+        year = int(item["ledger_year"])
+        grouped.setdefault(year, []).append(item)
+
+    merged = {"write": [], "skip": [], "conflict": []}
+    merged["conflict"].extend({
+        **dict(item),
+        "_check": {
+            "verdict": "conflict",
+            "reason": "项目交付年度未确定；禁止默认写入本年度盈亏表",
+        },
+    } for item in missing_year_items)
+    checks = {}
+    for year, items in grouped.items():
+        if year not in rows_by_year:
+            merged["conflict"].extend({
+                **dict(item),
+                "_check": {
+                    "verdict": "conflict",
+                    "reason": f"找不到 {year} 年盈亏核算表，无法执行写前校验",
+                },
+            } for item in items)
+            continue
+        subplan = {**plan, "auto": items}
+        path = ledger_paths.get(year)
+        checked = validate(subplan, rows_by_year[year], ledger_path=path)
+        for bucket in merged:
+            merged[bucket].extend(checked.get(bucket) or [])
+        if path is not None:
+            checks[str(year)] = {
+                "path": str(path),
+                "sha256": common.sha256_file(path),
+            }
+
+    out = {
+        "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "hexiao_date": plan.get("hexiao_date") or "",
+        "counts": {key: len(value) for key, value in merged.items()},
+        "selection": {
+            "mode": "all_auto_by_delivery_year",
+            "selected": sum(len(v) for v in grouped.values()),
+            "total_auto": sum(len(v) for v in grouped.values()),
+        },
+        "duplicate_writeoff_audits": plan.get("duplicate_writeoff_audits") or {},
+        "duplicate_writeoff_audit_sha256": plan.get("duplicate_writeoff_audit_sha256") or "",
+        "parent_fallback_allocations": plan.get("parent_fallback_allocations") or {},
+        "business_rules": plan.get("business_rules") or {},
+        "ledger_targets": {
+            str(year): str(path) for year, path in sorted(ledger_paths.items())
+        },
+        "ledger_checks": checks,
+        **merged,
+    }
+    if len(checks) == 1:
+        only = next(iter(checks.values()))
+        out["ledger_path"] = only["path"]
+        out["ledger_sha256"] = only["sha256"]
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="写入前校验计划（plan→validate→execute）")
     # --plan / --ledger 都可不给：不给就去工作区自己找（脏活归程序，别让 AI/她填路径）
     ap.add_argument("--plan", default="", help="判定结果 json；不给则取 04_产出 最新")
-    ap.add_argument("--ledger", default="", help="盈亏核算表副本（只读）；不给则取 02_我的表副本/*盈亏*")
+    ap.add_argument("--ledger", default="", help="本年度盈亏核算表副本（只读）")
+    ap.add_argument(
+        "--ledger-year", action="append", default=[], metavar="YEAR=PATH",
+        help="其它年度盈亏工作副本，可重复，例如 2025=...xlsx",
+    )
     ap.add_argument("--out", default="", help="校验后计划 json")
     # 防呆：同上。--workspace 还用于在没给 --out 时把结果落进正确的 04_产出/
     ap.add_argument("--workspace", default="", help="工作区根（没给 --out 时用它定产出位置）")
@@ -1069,15 +1145,6 @@ def main(argv=None) -> int:
         return c[-1] if c else None
 
     plan_p = Path(args.plan) if args.plan else (_latest("判定结果_*.json") or Path(""))
-    if args.ledger:
-        ledger_p = Path(args.ledger)
-    else:
-        cand = [
-            p for p in sorted((ws / "02_我的表副本").glob("*盈亏*"))
-            if not p.name.startswith(("~$", "."))
-        ] if (ws / "02_我的表副本").is_dir() else []
-        ledger_p = cand[0] if cand else Path("")
-
     if not plan_p.is_file():
         print(
             f"ERROR: 找不到判定结果{f' {plan_p}' if args.plan else f'（{out_dir} 里没有 判定结果_*.json）'}"
@@ -1085,21 +1152,43 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not ledger_p.is_file():
-        print(
-            f"ERROR: 找不到盈亏表{f' {ledger_p}' if args.ledger else f'（{ws}/02_我的表副本/ 里没有 *盈亏* 文件）'}",
-            file=sys.stderr,
-        )
-        return 2
-
     plan = json.loads(plan_p.read_text(encoding="utf-8"))
     try:
-        rows = read_ledger_rows(ledger_p)
+        ledger_paths = {
+            int(year): Path(path).resolve()
+            for year, path in (plan.get("ledger_targets") or {}).items()
+            if path
+        }
+        if args.ledger or args.ledger_year:
+            ledger_paths.update(common.discover_year_ledgers(
+                ws, primary=args.ledger, year_specs=args.ledger_year
+            ))
+        elif not ledger_paths:
+            ledger_paths = common.discover_year_ledgers(ws)
+        if any(item.get("ledger_year") is None for item in (plan.get("auto") or [])):
+            raise ValueError("判定结果存在未确定交付年度的自动写入项；禁止默认使用本年度盈亏表")
+        needed_years = {
+            int(item["ledger_year"])
+            for item in (plan.get("auto") or [])
+        }
+        missing = sorted(
+            year for year in needed_years
+            if year not in ledger_paths or not ledger_paths[year].is_file()
+        )
+        if missing:
+            raise ValueError(
+                "缺少写前校验所需年度盈亏表：" + "、".join(map(str, missing))
+            )
+        rows_by_year = {
+            year: read_ledger_rows(path)
+            for year, path in ledger_paths.items()
+            if year in needed_years
+        }
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
-    result = validate(plan, rows, ledger_path=ledger_p)
+    result = validate_by_year(plan, rows_by_year, ledger_paths)
     # 没给 --out 就落进**解析后的工作区**的 04_产出/，别落到 plan 旁边（会跟日清分家）
     out_p = Path(args.out) if args.out else (out_dir / "写入计划_校验后.json")
     out_p.parent.mkdir(parents=True, exist_ok=True)

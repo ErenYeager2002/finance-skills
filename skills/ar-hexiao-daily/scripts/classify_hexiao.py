@@ -626,6 +626,8 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
         i_rate = _col(h, "订单交付", "汇率", aliases)
         i_cur = _col(h, "订单交付", "币种", aliases)
         i_name = _col(h, "订单交付", "订单名称", aliases)
+        i_delivery_date = _col(h, "订单交付", "项目交付日期", aliases)
+        i_delivery_status = _col(h, "订单交付", "交付日期取数状态", aliases)
         for vals in body:
             ar = str(_get(vals, c["AR"]) or "").strip()
             so = str(_get(vals, c["SO"]) or "").strip()
@@ -645,6 +647,8 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
                     "written_off_present": False,
                     "written_off_local_present": False,
                     "rate": None, "currency": "", "name": "",
+                    "delivery_date": None, "delivery_date_issue": "",
+                    "_delivery_dates": set(), "_delivery_date_issues": set(),
                     "source": path.name, "snapshot_date": _export_date(path),
                 }
                 order_map[key] = old
@@ -659,14 +663,38 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
             rate = common.to_number(_get(vals, i_rate))
             currency = str(_get(vals, i_cur) or "").strip()
             name = str(_get(vals, i_name) or "").strip()
+            delivery_raw = _get(vals, i_delivery_date)
+            delivery_status = str(_get(vals, i_delivery_status) or "").strip()
             if rate is not None:
                 old["rate"] = rate
             if currency:
                 old["currency"] = currency
             if name:
                 old["name"] = name
+            if delivery_raw not in (None, ""):
+                delivery_date = common.norm_date(delivery_raw)
+                if delivery_date is not None:
+                    old["_delivery_dates"].add(delivery_date)
+                else:
+                    old["_delivery_date_issues"].add(
+                        f"项目交付日期格式无效：{str(delivery_raw).strip()}"
+                    )
+            if delivery_status and not str(delivery_status).endswith("明确值"):
+                old["_delivery_date_issues"].add(delivery_status)
             old["source"] = path.name
             old["snapshot_date"] = _export_date(path)
+
+    for order in order_map.values():
+        dates = set(order.pop("_delivery_dates", set()) or set())
+        issues = set(order.pop("_delivery_date_issues", set()) or set())
+        if len(dates) == 1 and not any("冲突" in str(x) for x in issues):
+            order["delivery_date"] = next(iter(dates))
+        elif len(dates) > 1:
+            order["delivery_date"] = None
+            issues.add("项目交付日期冲突：不同取数记录出现多个日期")
+        if order.get("delivery_date") is None and not issues:
+            issues.add("项目交付日期缺失：智云订单详情没有明确值")
+        order["delivery_date_issue"] = "；".join(sorted(issues))
 
     # 核销明细可能补出下单表遗漏的 SO；先建立最低限度订单对象，保证父 AR
     # 审计能看到完整关联范围。金额仍不从核销明细反推订单已核销字段。
@@ -679,6 +707,8 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
                 "written_off": None, "written_off_local": None,
                 "written_off_present": False,
                 "written_off_local_present": False,
+                "delivery_date": None,
+                "delivery_date_issue": "项目交付日期缺失：订单仅由核销明细补出",
                 "currency": "", "name": "", "source": item.get("source") or "",
                 "snapshot_date": item.get("snapshot_date"),
             }
@@ -1277,9 +1307,20 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
     _prepare_parent_totals(p)
     sod_lines: Dict[str, List[dict]] = p.get("sod_lines") or {}
     orders = p.get("orders") or []
+    route_fields_by_so = {
+        str(order.get("so") or "").strip(): {
+            "delivery_date": order.get("delivery_date"),
+            "delivery_date_issue": order.get("delivery_date_issue") or "",
+        }
+        for order in orders if str(order.get("so") or "").strip()
+    }
     duplicate_audit = p.get("duplicate_writeoff_audit") or {}
 
     def finish(items: List[dict]) -> List[dict]:
+        for item in items:
+            route_fields = route_fields_by_so.get(str(item.get("so") or "").strip()) or {}
+            item.setdefault("delivery_date", route_fields.get("delivery_date"))
+            item.setdefault("delivery_date_issue", route_fields.get("delivery_date_issue") or "")
         if duplicate_audit:
             for item in items:
                 item["duplicate_writeoff_audit"] = duplicate_audit
@@ -2137,6 +2178,14 @@ def classify_one(
         "warning_codes": list(rec.get("warning_codes") or []),
         "duplicate_writeoff_audit": rec.get("duplicate_writeoff_audit") or {},
         "ambiguous_sod_waterfall": rec.get("ambiguous_sod_waterfall") or {},
+        "ledger_year": rec.get("target_ledger_year"),
+        "ledger_path": rec.get("target_ledger_path") or "",
+        "delivery_date": (
+            rec.get("delivery_date").isoformat()
+            if isinstance(rec.get("delivery_date"), dt.date)
+            else str(rec.get("delivery_date") or "")
+        ),
+        "delivery_date_issue": rec.get("delivery_date_issue") or "",
         # 仅供同一 SO/SOD 的跨父 AR 分笔链复核；不得用这些字段跨 SO 或跨 SOD 合并。
         "split_payment_source": {
             "amount_local": common.to_number(rec.get("amount_local")),
@@ -2156,9 +2205,16 @@ def classify_one(
             "writeoff_sequence_key": rec.get("writeoff_sequence_key"),
         },
     }
+    if "_year_route_order" in rec:
+        result["_year_route_order"] = rec["_year_route_order"]
     if rec.get("so"):
+        ledger_label = (
+            f"{rec.get('target_ledger_year')} 年盈亏"
+            if rec.get("target_ledger_year")
+            else "盈亏"
+        )
         result["locate_hint"] = (
-            f"在盈亏『明细』按「新智云单号」筛选：{rec['so']}"
+            f"在{ledger_label}『明细』按「新智云单号」筛选：{rec['so']}"
             + (f"，找应收金额={rec.get('amount_orig')} 那行" if rec.get("amount_orig") is not None else "")
             + "（禁止用行号）"
         )
@@ -2278,8 +2334,13 @@ def classify_one(
 
     if ledger is None:
         result["bucket"] = "hold"
-        result["code"] = "E2"
-        result["reason"] = "未提供盈亏表，无法确认 SO 是否在明细"
+        target_year = rec.get("target_ledger_year")
+        if target_year is not None and int(target_year) != int(year_now):
+            result["code"] = "E3"
+            result["reason"] = f"没有提供 {int(target_year)} 年盈亏核算表工作副本"
+        else:
+            result["code"] = "E2"
+            result["reason"] = "未提供本年度盈亏表，无法确认 SO 是否在明细"
         return result
 
     so, sod = rec.get("so") or "", rec.get("sod") or ""
@@ -2319,12 +2380,12 @@ def classify_one(
         result["reason"] = "无单号"
         return result
     if how == "E2" or row is None:
-        # 表里真找不到这单，这时才区分「跨年老单」还是「还没交付」
-        y = common.year_from_so(sod or so)
+        # 已按交付年度选定盈亏表；只有目标年度表缺单时才挂账。
+        y = rec.get("target_ledger_year")
         result["bucket"] = "hold"
-        if y is not None and y < year_now:
+        if y is not None and int(y) != int(year_now):
             result["code"] = "E3"
-            result["reason"] = f"{y} 年的老单，今年盈亏表里没有这行"
+            result["reason"] = f"已检查 {int(y)} 年盈亏表，但明细里没有这张单"
         else:
             result["code"] = "E2"
             result["reason"] = "盈亏表里还没有这张单（多半还没交付进表）"
@@ -3452,9 +3513,75 @@ def classify_records(
     }
 
 
+def classify_records_by_year(
+    records: List[dict],
+    ledgers: Dict[int, LedgerIndex],
+    rates: Optional[Dict[str, float]] = None,
+    ledger_paths: Optional[Dict[int, Path]] = None,
+) -> dict:
+    """只按智云订单详情的项目交付日期选择年度盈亏表；缺失或冲突时挂账。"""
+    rates = rates or {}
+    ledger_paths = ledger_paths or {}
+    grouped: Dict[int, List[dict]] = {}
+    unrouted: List[dict] = []
+    for order, source in enumerate(records):
+        rec = dict(source)
+        rec["_year_route_order"] = order
+        delivery_date = common.norm_date(rec.get("delivery_date"))
+        if delivery_date is None:
+            rec["target_ledger_year"] = None
+            rec["target_ledger_path"] = ""
+            if not rec.get("forced_code"):
+                issue = str(rec.get("delivery_date_issue") or "").strip()
+                conflict = "冲突" in issue
+                rec["forced_code"] = (
+                    "E_DELIVERY_DATE_CONFLICT" if conflict else "E_DELIVERY_DATE_MISSING"
+                )
+                rec["forced_reason"] = (
+                    issue
+                    or "智云订单详情缺少项目交付日期，无法确定年度盈亏表；禁止按 SO/SOD 编号推测"
+                )
+            unrouted.append(rec)
+            continue
+        year = delivery_date.year
+        rec["delivery_date"] = delivery_date
+        rec["target_ledger_year"] = year
+        rec["target_ledger_path"] = str(ledger_paths.get(year) or "")
+        grouped.setdefault(int(year), []).append(rec)
+
+    all_results: List[dict] = []
+    if unrouted:
+        part = classify_records(unrouted, None, rates)
+        for bucket in ("auto", "hold", "exception"):
+            all_results.extend(part.get(bucket) or [])
+    for year, year_records in grouped.items():
+        part = classify_records(year_records, ledgers.get(year), rates)
+        for bucket in ("auto", "hold", "exception"):
+            all_results.extend(part.get(bucket) or [])
+
+    all_results.sort(key=lambda item: int(item.pop("_year_route_order", 0) or 0))
+    auto = [r for r in all_results if r.get("bucket") == "auto"]
+    hold = [r for r in all_results if r.get("bucket") == "hold"]
+    exc = [r for r in all_results if r.get("bucket") == "exception"]
+    return {
+        "auto": auto,
+        "hold": hold,
+        "exception": exc,
+        "counts": {
+            "auto": len(auto), "hold": len(hold),
+            "exception": len(exc), "total": len(all_results),
+        },
+        "e_code_dist": _dist(all_results),
+        "ar_summary": build_ar_summary(all_results),
+        "ledger_targets": {
+            str(year): str(path) for year, path in sorted(ledger_paths.items())
+        },
+    }
+
+
 # 「没交付进表」的挂起码：只有这些才让一笔到账的流转状态掉到「部分」。
 # E5（部分核销）不在内 —— 钱已全核落地、她拆行即算更新（2026-07-24 明妹口径）。
-_FLOW_WAIT_CODES = {"E2", "E3"}
+_FLOW_WAIT_CODES = {"E2", "E3", "E_DELIVERY_DATE_MISSING", "E_DELIVERY_DATE_CONFLICT"}
 
 
 def _flow_ready(item: dict) -> str:
@@ -3555,7 +3682,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="核销判定（单入口 · SOD 级 · 三栏）")
     ap.add_argument("--workspace", default=str(common.WORK))
     ap.add_argument("--fixture", default="", help="离线夹具 JSON（v2: payments/sod_lines）")
-    ap.add_argument("--ledger", default="", help="盈亏核算表副本（只读）")
+    ap.add_argument("--ledger", default="", help="本年度盈亏核算表副本（只读）")
+    ap.add_argument(
+        "--ledger-year", action="append", default=[], metavar="YEAR=PATH",
+        help="其它年度盈亏工作副本，可重复，例如 2025=...xlsx",
+    )
     ap.add_argument("--rate", action="append", default=[], help="外币汇率 美元USD=7.0")
     ap.add_argument("--out", default="", help="判定结果 json 路径")
     ap.add_argument("--flow", default="", help="到账流转表副本（只读）；不给则扫 02_我的表副本/")
@@ -3580,20 +3711,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR: 认不出 --hexiao-date {args.hexiao_date!r}", file=sys.stderr)
         return 2
 
-    ledger = None
-    if args.ledger:
-        ledger = LedgerIndex(Path(args.ledger))
-    else:
-        cand = sorted((ws / "02_我的表副本").glob("*盈亏*")) if (ws / "02_我的表副本").is_dir() else []
-        cand = [p for p in cand if not p.name.startswith("~$")]
-        if cand:
-            ledger = LedgerIndex(cand[0])
-        else:
-            print(
-                "WARN: 未提供盈亏表（--ledger 或 02_我的表副本/*盈亏*）；"
-                "全部单将 hold E2，不会瞎填五列",
-                file=sys.stderr,
-            )
+    try:
+        ledger_paths = common.discover_year_ledgers(
+            ws, primary=args.ledger, year_specs=args.ledger_year
+        )
+        ledgers = {year: LedgerIndex(path) for year, path in ledger_paths.items()}
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not ledgers:
+        print(
+            "WARN: 未提供任何年度盈亏表；本年度订单 hold E2，往年订单 hold E3",
+            file=sys.stderr,
+        )
 
     try:
         if args.fixture:
@@ -3603,12 +3733,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         allocation_state = FAL.load(ws)
         for payment in payments:
             payment.setdefault("_fallback_allocation_state", allocation_state)
-            if ledger is not None:
+            if ledgers:
                 payment["_ledger_settled_sos"] = sorted({
                     str(order.get("so") or "").strip()
                     for order in (payment.get("orders") or [])
-                    if order.get("so")
-                    and ledger.settled_without_open_row(str(order.get("so") or "").strip()) is not None
+                    if order.get("so") and any(
+                        index.settled_without_open_row(
+                            str(order.get("so") or "").strip()
+                        ) is not None
+                        for index in ledgers.values()
+                    )
                 })
         records = expand_payments(payments, rates)
     except (InputError, ValueError) as e:
@@ -3661,7 +3795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         hexiao_date = hexiao_date or requested_date
 
-    result = classify_records(records, ledger, rates)
+    result = classify_records_by_year(records, ledgers, rates, ledger_paths)
     duplicate_audits = next(
         (
             p.get("_duplicate_writeoff_audits")
@@ -3680,6 +3814,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "parent_fallback_allocation": "non_whole_only_delivery_amount_ascending_outstanding_waterfall",
         "parent_fallback_state": FAL.LEDGER_NAME,
         "ledger_settled_precheck": "settled_row_exists_and_no_open_split_row",
+        "ledger_year_routing": "zhiyun_project_delivery_date_to_matching_annual_ledger_no_number_inference",
         "missing_rate_policy": "use_writeoff_amount_directly",
         "technical_amount_tolerance": TOL,
         "cent_tolerance": float(amount_policy.CENT_TOLERANCE),

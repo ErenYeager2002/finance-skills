@@ -222,3 +222,53 @@ def test_finalize_rejects_formula_without_cached_value(tmp_path):
         assert "公式没有缓存值" in str(exc)
     else:
         raise AssertionError("公式缺少缓存值时必须拒绝交付")
+
+
+def test_rebuild_uses_actual_non_contiguous_sheet_id(tmp_path):
+    source = tmp_path / "source.xlsx"
+    _book_with_calc_chain_and_external_link(source)
+
+    def make_sheet_id_non_contiguous(payload):
+        workbook = payload["xl/workbook.xml"].decode("utf-8")
+        payload["xl/workbook.xml"] = re.sub(
+            r'sheetId="1"', 'sheetId="7"', workbook, count=1
+        ).encode("utf-8")
+        payload.pop("xl/calcChain.xml", None)
+
+    _rewrite(source, make_sheet_id_non_contiguous)
+    W.finalize_workbook(source, {"明细": object()})
+    with zipfile.ZipFile(source) as zf:
+        chain = zf.read("xl/calcChain.xml").decode("utf-8")
+    assert set(re.findall(r'\bi="([^"]+)"', chain)) == {"7"}
+
+
+def test_portable_copy_rebuilds_stale_calc_chain(tmp_path):
+    source = tmp_path / "source.xlsx"
+    portable = tmp_path / "portable.xlsx"
+    _book_with_calc_chain_and_external_link(source)
+
+    def add_stale_entry(payload):
+        chain = payload["xl/calcChain.xml"].decode("utf-8")
+        payload["xl/calcChain.xml"] = chain.replace(
+            "</calcChain>", '<c r="Z99" i="1"/></calcChain>'
+        ).encode("utf-8")
+
+    _rewrite(source, add_stale_entry)
+    audit = W.create_portable_copy(source, portable)
+    assert audit.formula_cells == 1
+    with zipfile.ZipFile(portable) as zf:
+        chain = zf.read("xl/calcChain.xml").decode("utf-8")
+    assert 'r="C1"' in chain
+    assert 'r="B1"' not in chain
+    assert 'r="Z99"' not in chain
+
+
+def test_finalize_static_report_removes_recalc_flags_and_formulas_are_forbidden(tmp_path):
+    report = tmp_path / "report.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "静态结果"
+    wb.save(report)
+    result = W.finalize_static_report(report)
+    assert result.formula_cells == 0
+    assert result.full_calc_on_load == "0"
+    assert result.force_full_calc == "0"

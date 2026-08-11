@@ -250,6 +250,21 @@ def test_verify_sources_detects_missing(tmp_path):
     assert V.do_verify(ws) == 1
 
 
+def test_verify_sources_excludes_registered_writable_copy(tmp_path):
+    ws = tmp_path / "工作区"
+    (ws / "02_我的表副本").mkdir(parents=True)
+    writable = ws / "02_我的表副本" / "长期工作副本.xlsx"
+    protected = ws / "02_我的表副本" / "原始表.xlsx"
+    writable.write_bytes(b"before")
+    protected.write_bytes(b"source")
+    V.do_snapshot(ws)
+    V.register_mutable(ws, writable)
+    writable.write_bytes(b"after")
+    assert V.do_verify(ws) == 0
+    protected.write_bytes(b"changed")
+    assert V.do_verify(ws) == 1
+
+
 # ---------- 真实表集成 ----------
 
 @pytest.mark.skipif(not FLOW_HK.is_file() or not FLOW_WX.is_file(), reason="无真实流转表副本")

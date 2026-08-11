@@ -13,6 +13,7 @@ from conftest import LEDGER_FULL  # noqa: E402
 
 import validate_plan as V  # noqa: E402
 import apply_to_copy as A  # noqa: E402
+import apply_all as AA  # noqa: E402
 
 HDR = ["部门", "销售人员", "客户名称", "单号", "新智云单号", "应收金额",
        "计提金额", "回款明细", "是否结账（是/否）", "收款时间", "收款方式(支/汇/现)", "实收金额",
@@ -92,6 +93,69 @@ def test_empty_row_is_writable(tmp_path):
     led = _ledger(tmp_path, [("SO26010001", "SOD26010001", None)])
     rows = V.read_ledger_rows(led)
     assert V.check_one(_item(2), rows)["verdict"] == "write"
+
+
+def test_validate_by_year_keeps_same_row_number_isolated(tmp_path):
+    y25 = tmp_path / "y25"
+    y26 = tmp_path / "y26"
+    y25.mkdir()
+    y26.mkdir()
+    led25 = _ledger(y25, [("SO25010001", "SOD25010001", None)])
+    led26 = _ledger(y26, [("SO26010001", "SOD26010001", None)])
+    old_item = _item(2, so="SO25010001", sod="SOD25010001")
+    new_item = _item(2, so="SO26010001", sod="SOD26010001")
+    old_item["ledger_year"] = 2025
+    new_item["ledger_year"] = 2026
+    checked = V.validate_by_year(
+        {"auto": [old_item, new_item]},
+        {2025: V.read_ledger_rows(led25), 2026: V.read_ledger_rows(led26)},
+        {2025: led25, 2026: led26},
+    )
+    assert checked["counts"] == {"write": 2, "skip": 0, "conflict": 0}
+    assert {item["ledger_year"] for item in checked["write"]} == {2025, 2026}
+    assert set(checked["ledger_checks"]) == {"2025", "2026"}
+
+
+def test_apply_all_writes_two_annual_ledgers_and_builds_combined_reports(tmp_path):
+    ws = tmp_path / "工作区"
+    ledger_dir = ws / "02_我的表副本"
+    out_dir = ws / "04_产出"
+    ledger_dir.mkdir(parents=True)
+    out_dir.mkdir(parents=True)
+    source25_dir = tmp_path / "source25"
+    source26_dir = tmp_path / "source26"
+    source25_dir.mkdir()
+    source26_dir.mkdir()
+    source25 = _ledger(source25_dir, [("SO25010001", "SOD25010001", None)])
+    source26 = _ledger(source26_dir, [("SO26010001", "SOD26010001", None)])
+    ledger25 = ledger_dir / "2025年盈亏工作副本.xlsx"
+    ledger26 = ledger_dir / "2026年盈亏工作副本.xlsx"
+    source25.replace(ledger25)
+    source26.replace(ledger26)
+
+    old_item = _item(2, so="SO25010001", sod="SOD25010001")
+    new_item = _item(2, so="SO26010001", sod="SOD26010001")
+    old_item["ledger_year"] = 2025
+    new_item["ledger_year"] = 2026
+    checked = V.validate_by_year(
+        {"auto": [old_item, new_item], "hexiao_date": "2026-08-10"},
+        {2025: V.read_ledger_rows(ledger25), 2026: V.read_ledger_rows(ledger26)},
+        {2025: ledger25, 2026: ledger26},
+    )
+    checked_path = out_dir / "写入计划_校验后.json"
+    checked_path.write_text(json.dumps(checked, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert AA.main([
+        "--checked", str(checked_path),
+        "--workspace", str(ws),
+        "--in-place",
+    ]) == 0
+    rows25 = V.read_ledger_rows(ledger25)
+    rows26 = V.read_ledger_rows(ledger26)
+    assert rows25[2]["回款明细"] == 100
+    assert rows26[2]["回款明细"] == 100
+    assert (out_dir / "变更清单_20260810.xlsx").is_file()
+    assert (out_dir / "订单写入差异_20260810.xlsx").is_file()
 
 
 def test_default_jiezhang_no_is_still_writable(tmp_path):

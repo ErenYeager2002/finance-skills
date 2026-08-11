@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
@@ -141,10 +142,12 @@ def _sheet_parts_in_order(payload: Mapping[str, bytes]) -> Sequence[Tuple[int, s
             part = target.group(1).lstrip("/")
             targets[rid.group(1)] = part if part.startswith("xl/") else f"xl/{part}"
     result = []
-    for index, match in enumerate(re.finditer(r'<sheet\b([^>]*)/?>', workbook_xml), 1):
-        rid = re.search(r'\br:id="([^"]+)"', match.group(1))
-        if rid and rid.group(1) in targets:
-            result.append((index, targets[rid.group(1)]))
+    for match in re.finditer(r'<sheet\b([^>]*)/?>', workbook_xml):
+        attrs = match.group(1)
+        rid = re.search(r'\br:id="([^"]+)"', attrs)
+        sheet_id = re.search(r'\bsheetId="(\d+)"', attrs)
+        if rid and sheet_id and rid.group(1) in targets:
+            result.append((int(sheet_id.group(1)), targets[rid.group(1)]))
     return result
 
 
@@ -195,6 +198,44 @@ def _rebuild_calc_chain(payload: Dict[str, bytes]) -> int:
     payload["xl/calcChain.xml"] = chain.encode("utf-8")
     _ensure_calc_chain_registration(payload)
     return len(entries)
+
+
+def _formula_chain_entries(payload: Mapping[str, bytes]) -> Sequence[Tuple[str, str]]:
+    entries = []
+    for sheet_id, part in _sheet_parts_in_order(payload):
+        if part not in payload:
+            continue
+        for cell in _CELL_RE.findall(_entry_text(payload, part)):
+            if not _FORMULA_RE.search(cell):
+                continue
+            ref = re.search(r'\br="([A-Z]{1,3}\d+)"', cell)
+            if ref:
+                entries.append((str(sheet_id), ref.group(1)))
+    return entries
+
+
+def _calc_chain_entries(payload: Mapping[str, bytes]) -> Sequence[Tuple[str, str]]:
+    if "xl/calcChain.xml" not in payload:
+        return []
+    entries = []
+    current_sheet = None
+    for tag in re.findall(r'<c\b[^>]*/>', _entry_text(payload, "xl/calcChain.xml")):
+        sheet = re.search(r'\bi="([^"]+)"', tag)
+        if sheet:
+            current_sheet = sheet.group(1)
+        ref = re.search(r'\br="([^"]+)"', tag)
+        if ref and current_sheet:
+            entries.append((current_sheet, ref.group(1)))
+    return entries
+
+
+def _assert_calc_chain_matches_formulas(payload: Mapping[str, bytes]) -> None:
+    expected = list(_formula_chain_entries(payload))
+    actual = list(_calc_chain_entries(payload))
+    if sorted(actual) != sorted(expected):
+        raise WorkbookFinalizeError(
+            f"计算链与公式位置不一致：公式 {len(expected)} 格，计算链 {len(actual)} 条"
+        )
 
 
 def _external_formula_count(payload: Mapping[str, bytes]) -> int:
@@ -508,6 +549,7 @@ def finalize_workbook(
         if rebuilt != _formula_cell_count(payload):
             raise WorkbookFinalizeError("计算链条目数与公式单元格数不一致")
         mode = "按公式缓存重建计算链"
+    _assert_calc_chain_matches_formulas(payload)
     workbook_name = "xl/workbook.xml"
     payload[workbook_name] = _set_safe_calc_flags(
         _entry_text(payload, workbook_name)
@@ -718,12 +760,10 @@ def create_portable_copy(source: Path, out: Path) -> PortableAudit:
     )
     payload[content_name] = content_xml.encode("utf-8")
 
-    if "xl/calcChain.xml" in payload:
-        payload["xl/calcChain.xml"] = _filter_calc_chain(
-            _entry_text(payload, "xl/calcChain.xml"), frozen
-        ).encode("utf-8")
-    elif _formula_cell_count(payload):
-        raise WorkbookFinalizeError("工作底稿没有计算链，不能生成免重算便携副本")
+    # 固化外链后按剩余公式重建，避免沿用旧链中的错误 sheetId 或多余条目。
+    if _formula_cell_count(payload):
+        _rebuild_calc_chain(payload)
+        _assert_calc_chain_matches_formulas(payload)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
@@ -747,12 +787,89 @@ def create_portable_copy(source: Path, out: Path) -> PortableAudit:
         problems.append(f"显示值变化 {audit.display_value_mismatches} 格")
     if audit.formula_cells and not audit.calc_chain_present:
         problems.append("剩余公式没有计算链")
+    if audit.formula_cells:
+        try:
+            _assert_calc_chain_matches_formulas(portable_payload)
+        except WorkbookFinalizeError as exc:
+            problems.append(str(exc))
     if audit.full_calc_on_load not in ("", "0") or audit.force_full_calc not in ("", "0"):
         problems.append("便携副本仍要求打开时全量重算")
     if problems:
         out.unlink(missing_ok=True)
         raise WorkbookFinalizeError("；".join(problems))
     return audit
+
+
+_FONT_CHILD_ORDER = {
+    name: index for index, name in enumerate(
+        ("b", "i", "strike", "outline", "shadow", "condense", "extend", "sz",
+         "color", "u", "vertAlign", "name", "family", "charset", "scheme")
+    )
+}
+
+
+def _remove_calc_chain(payload: Dict[str, bytes]) -> None:
+    payload.pop("xl/calcChain.xml", None)
+    rels_name = "xl/_rels/workbook.xml.rels"
+    rels_xml = _entry_text(payload, rels_name)
+    payload[rels_name] = re.sub(
+        r'<Relationship\b(?=[^>]*\bType="[^"]*/calcChain")[^>]*/>', "", rels_xml
+    ).encode("utf-8")
+    content_name = "[Content_Types].xml"
+    content_xml = _entry_text(payload, content_name)
+    payload[content_name] = re.sub(
+        r'<Override\b(?=[^>]*\bPartName="/xl/calcChain\.xml")[^>]*/>', "", content_xml
+    ).encode("utf-8")
+
+
+def _normalize_font_child_order(styles_xml: bytes) -> bytes:
+    root = ET.fromstring(styles_xml)
+    changed = False
+    for node in root.iter():
+        if node.tag.rsplit("}", 1)[-1] != "font":
+            continue
+        children = list(node)
+        ordered = sorted(
+            children,
+            key=lambda child: _FONT_CHILD_ORDER.get(child.tag.rsplit("}", 1)[-1], 999),
+        )
+        if children != ordered:
+            node[:] = ordered
+            changed = True
+    if not changed:
+        return styles_xml
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def finalize_static_report(path: Path) -> FinalizeResult:
+    """规范化无公式报表，关闭强制重算并修正字体节点顺序。"""
+    path = Path(path)
+    infos, payload = _read_package(path)
+    formula_cells = _formula_cell_count(payload)
+    if formula_cells:
+        raise WorkbookFinalizeError(
+            f"静态报表含 {formula_cells} 个公式，拒绝按无公式文件处理"
+        )
+    workbook_name = "xl/workbook.xml"
+    payload[workbook_name] = _set_safe_calc_flags(
+        _entry_text(payload, workbook_name)
+    ).encode("utf-8")
+    if "xl/styles.xml" in payload:
+        payload["xl/styles.xml"] = _normalize_font_child_order(payload["xl/styles.xml"])
+    _remove_calc_chain(payload)
+    _write_package(path, infos, payload)
+    result = inspect_calculation(path)
+    if result.formula_cells or result.calc_chain_present:
+        raise WorkbookFinalizeError("静态报表仍包含公式或计算链")
+    if result.full_calc_on_load not in ("", "0") or result.force_full_calc not in ("", "0"):
+        raise WorkbookFinalizeError("静态报表仍要求打开时全量重算")
+    return FinalizeResult(
+        mode="静态报表规范化",
+        formula_cells=0,
+        calc_chain_present=False,
+        full_calc_on_load=result.full_calc_on_load,
+        force_full_calc=result.force_full_calc,
+    )
 
 
 def portable_path_for(path: Path) -> Path:

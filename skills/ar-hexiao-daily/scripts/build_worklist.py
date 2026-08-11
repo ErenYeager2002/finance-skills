@@ -34,6 +34,7 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import common  # noqa: E402
+import workbook_finalize  # noqa: E402
 
 # 状态 → (排序权重, 颜色, 这行该干嘛)
 STATUS = {
@@ -86,7 +87,8 @@ def _diff_text(five: dict, cur: dict, derived: dict) -> str:
 # 这些码的 reason 是**逐笔算出来的、自带操作指引**（插哪一行、候选 SOD 是哪几个…），
 # 比 config 里的通用建议有用得多 → 「怎么办」直接用 reason。
 SPECIFIC_CODES = {
-    "E4", "E5", "E7", "E8",
+    "E3", "E4", "E5", "E7", "E8",
+    "E_DELIVERY_DATE_MISSING", "E_DELIVERY_DATE_CONFLICT",
     "E_PARENT_WRITEOFF_MISMATCH",
     "E_SYSTEM_OVER_WRITEOFF_UNRESOLVED",
 }
@@ -322,6 +324,7 @@ def build_workbook(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(out_path))
+    workbook_finalize.finalize_static_report(out_path)
     return out_path
 
 
