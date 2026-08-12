@@ -189,7 +189,6 @@ def write_plan(
         if op.get("type") == "split_payment_chain":
             steps = op.get("steps") or []
             step_index = int(it.get("split_chain_index") or 0)
-            step = steps[step_index]
             chain_base = applied_r - step_index
             chain_rows = list(range(
                 chain_base,
@@ -340,6 +339,54 @@ def write_plan(
                 "新增行号": applied_r + 1 if op.get("type") == "split_below" else "",
             }
         )
+
+    # SO 的最后一个 SOD 结清时，同一次补填此前已结清 SOD 的计提。补填只动
+    # 计提和必要的差异公式，不复制回款日期、方式或金额，也不新增到账记录。
+    for it in items:
+        for backfill in it.get("so_accrual_backfills") or []:
+            verdict = (backfill.get("_check") or {}).get("verdict")
+            if verdict in {"skip", "conflict"}:
+                continue
+            original_row = int(backfill["ledger_row_ref"])
+            target_row = final_original_row(original_row)
+            backfill["_applied_row_ref"] = target_row
+            accrual = float(backfill["accrual"])
+            edits.append((original_row, cols["计提"], accrual))
+            formula = ""
+            if backfill.get("difference") is not None:
+                if "差异" not in cols:
+                    raise ValueError("历史计提补填需要写差异，但盈亏『明细』找不到“差异”列")
+                source_rows_for_formula = [
+                    final_original_row(int(row_no))
+                    for row_no in (backfill.get("business_rows") or [original_row])
+                ]
+                formula = difference_formula(source_rows_for_formula, target_row)
+                backfill["_difference_formula"] = formula
+                edits.append((
+                    original_row,
+                    cols["差异"],
+                    xlsx_patch.FormulaValue(formula, float(backfill["difference"])),
+                ))
+            before = before_rows.get(original_row, {})
+            after_five = {k: "" for k in FIVE}
+            after_five["计提"] = _norm(accrual)
+            changes.append({
+                "案例ID": it.get("case_id"),
+                "行号": target_row,
+                "SO": backfill.get("so"),
+                "SOD": backfill.get("sod"),
+                "改前": {k: _norm(before.get(k)) for k in FIVE},
+                "改后": after_five,
+                "派生列_改前": {
+                    "差异": _norm(before.get("差异"))
+                } if backfill.get("difference") is not None else {},
+                "派生列_改后": {
+                    "差异": _norm(backfill.get("difference"))
+                } if backfill.get("difference") is not None else {},
+                "派生列_公式": {"差异": formula},
+                "操作": "SO 全部 SOD 结清后补填历史计提",
+                "新增行号": "",
+            })
     patch_result = xlsx_patch.patch_cells(
         src,
         out,
@@ -562,6 +609,36 @@ def verify_written(out: Path, items: List[dict]) -> List[str]:
                 )
             if "差异" in formula_cols and _norm(row.get("差异")) not in ("", "None"):
                 problems.append(f"第 {r} 行 多 SOD 合并后差异应留空")
+        for backfill in it.get("so_accrual_backfills") or []:
+            if (backfill.get("_check") or {}).get("verdict") == "conflict":
+                continue
+            backfill_r = int(
+                backfill.get("_applied_row_ref") or backfill["ledger_row_ref"]
+            )
+            backfill_row = rows.get(backfill_r)
+            if backfill_row is None:
+                problems.append(f"第 {backfill_r} 行历史计提补填后读不到")
+                continue
+            if _norm(backfill_row.get("计提")) != _norm(backfill.get("accrual")):
+                problems.append(
+                    f"第 {backfill_r} 行历史计提：期望 {_norm(backfill.get('accrual'))!r} "
+                    f"实际 {_norm(backfill_row.get('计提'))!r}"
+                )
+            if backfill.get("difference") is not None:
+                if _norm(backfill_row.get("差异")) != _norm(backfill.get("difference")):
+                    problems.append(
+                        f"第 {backfill_r} 行历史差异：期望 {_norm(backfill.get('difference'))!r} "
+                        f"实际 {_norm(backfill_row.get('差异'))!r}"
+                    )
+                expected_formula = backfill.get("_difference_formula")
+                actual_formula = formula_ws.cell(
+                    backfill_r, formula_cols["差异"]
+                ).value
+                if expected_formula and actual_formula != expected_formula:
+                    problems.append(
+                        f"第 {backfill_r} 行历史差异公式：期望 {expected_formula!r} "
+                        f"实际 {actual_formula!r}"
+                    )
     formula_wb.close()
     return problems
 
@@ -687,6 +764,24 @@ def _comparison_objects(items: List[dict]) -> List[dict]:
                 "object_type": "分笔链最终未回款行",
                 "planned_row": unpaid_row,
                 "expected": unpaid_expected,
+            })
+        for backfill in item.get("so_accrual_backfills") or []:
+            if (backfill.get("_check") or {}).get("verdict") == "conflict":
+                continue
+            expected_backfill = {
+                "SO": backfill.get("so") or "",
+                "SOD": backfill.get("sod") or "",
+                "计提": backfill.get("accrual"),
+            }
+            if backfill.get("difference") is not None:
+                expected_backfill["差异"] = backfill.get("difference")
+            objects.append({
+                "item": item,
+                "object_type": "SO 全部 SOD 结清后历史计提补填",
+                "planned_row": int(
+                    backfill.get("_applied_row_ref") or backfill["ledger_row_ref"]
+                ),
+                "expected": expected_backfill,
             })
     return objects
 

@@ -59,6 +59,21 @@ class FormulaValue:
 
 
 @dataclass(frozen=True)
+class RichTextRun:
+    """单元格富文本的一段；color 使用 8 位 ARGB，例如 FFFF0000。"""
+
+    text: str
+    color: str = ""
+
+
+@dataclass(frozen=True)
+class RichTextValue:
+    """需要保留局部字体颜色的内联字符串。"""
+
+    runs: Tuple[RichTextRun, ...]
+
+
+@dataclass(frozen=True)
 class PatchResult:
     """补丁影响摘要，供写后模块判断是否需要重建计算链。"""
 
@@ -182,6 +197,14 @@ def _render_cell(ref: str, value, style: Optional[str]) -> str:
             f'<c r="{ref}"{s_attr}><f>{escape(formula)}</f>'
             f'<v>{_formula_cache_text(value.cached)}</v></c>'
         )
+    if isinstance(value, RichTextValue):
+        parts: List[str] = []
+        for run in value.runs:
+            props = f'<rPr><color rgb="{escape(run.color.upper())}"/></rPr>' if run.color else ""
+            parts.append(
+                f'<r>{props}<t xml:space="preserve">{escape(str(run.text))}</t></r>'
+            )
+        return f'<c r="{ref}"{s_attr} t="inlineStr"><is>{"".join(parts)}</is></c>'
     if isinstance(value, (dt.date, dt.datetime)):
         return f'<c r="{ref}"{s_attr}><v>{to_serial(value):g}</v></c>'
     if isinstance(value, bool):

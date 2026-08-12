@@ -271,8 +271,9 @@ def test_sod_ambiguous_amount_over_first_waterfalls_to_next_open_sod():
         ("SOD2", 100.0),
         ("SOD3", 50.0),
     ]
-    assert result["auto"][0]["five_cols"]["计提"] == 100.0
-    assert result["auto"][1]["five_cols"]["计提"] == 100.0
+    # 新规则：同一 SO 的 SOD3 尚未结清时，前两个已结清 SOD 也暂不计提。
+    assert result["auto"][0]["five_cols"]["计提"] is None
+    assert result["auto"][1]["five_cols"]["计提"] is None
     assert result["auto"][2]["row_operation"]["type"] == "split_below"
     assert result["auto"][2]["row_operation"]["unpaid_receivable"] == 50.0
     assert all(

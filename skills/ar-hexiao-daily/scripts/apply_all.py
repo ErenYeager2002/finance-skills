@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-校验与《核销日清》生成后统一写入：先盈亏明细，成功后再流转安全子集。
+校验与《核销日清》生成后统一写入：先把 SO 与交付金额写入流转表，
+再写盈亏明细，最后按实际写入结果回填流转状态和红字。
 
 不再要求人工确认；--confirmed 仅为旧命令兼容参数。
 盈亏失败 → 不写流转。
@@ -19,6 +20,7 @@ sys.path.insert(0, str(HERE))
 import common  # noqa: E402
 import apply_to_copy  # noqa: E402
 import apply_flow  # noqa: E402
+import build_flow_plan  # noqa: E402
 import build_task_reports  # noqa: E402
 import verify_sources  # noqa: E402
 import workbook_finalize  # noqa: E402
@@ -226,13 +228,32 @@ def main(argv=None) -> int:
                 print(f"  - {item}", file=sys.stderr)
             return 2
 
+    date_value = common.norm_date(plan.get("hexiao_date"))
+    date_tag = date_value.strftime("%Y%m%d") if date_value else "未定日期"
+
+    # 流转计划在盈亏写入前就要使用：智云取数与分类完成后，先登记 SO 和交付金额。
+    flow_plan_path = Path(args.flow_plan) if args.flow_plan else ws / "04_产出" / "流转写入计划_校验后.json"
+    flow_plan_data = None
+    if flow_plan_path.is_file():
+        flow_plan_data = json.loads(flow_plan_path.read_text(encoding="utf-8"))
+        prefill_args = [
+            "--plan", str(flow_plan_path),
+            "--workspace", str(args.workspace),
+            "--phase", "prefill",
+            "--report", str(ws / "04_产出" / f"流转前置变更清单_{date_tag}.xlsx"),
+        ]
+        if args.flow_in_place:
+            prefill_args.append("--in-place")
+        rc0 = apply_flow.main(prefill_args)
+        if rc0 != 0:
+            print(f"ERROR: 流转表前置填单失败 EXIT:{rc0}，盈亏表未写。", file=sys.stderr)
+            return rc0
+
     if args.in_place:
         for year in grouped:
             verify_sources.register_mutable(ws, ledger_paths[year])
 
     report_parts = {"变更清单": [], "订单写入差异": []}
-    date_value = common.norm_date(plan.get("hexiao_date"))
-    date_tag = date_value.strftime("%Y%m%d") if date_value else "未定日期"
     with tempfile.TemporaryDirectory(prefix="ar-yearly-plan-") as temp_dir:
         # 兼容原有空计划流程：虽然没有单元格需要写，仍让盈亏写入器完成
         # 空计划检查，再继续流转和最终来源指纹刷新。
@@ -291,23 +312,24 @@ def main(argv=None) -> int:
         )
     apply_to_copy._mark_review_applied(checked_path)
 
-    # 2) 流转
-    flow_plan = args.flow_plan
-    if not flow_plan:
-        ws = common.resolve_workspace(args.workspace)
-        cand = ws / "04_产出" / "流转写入计划_校验后.json"
-        if cand.is_file():
-            flow_plan = str(cand)
-    if not flow_plan or not Path(flow_plan).is_file():
+    # 3) 盈亏全部写入并回读成功后，再按真实结果回填流转状态。
+    if flow_plan_data is None:
         print("WARN: 无流转写入计划，跳过流转写入（盈亏已成功）。")
         _record_done(args, ledger_written=bool(writable), flow_written=False)
         _resnapshot_sources(args.workspace)
         return 0
 
+    final_flow_plan = build_flow_plan.finalize_plan_after_ledger(flow_plan_data, plan)
+    final_flow_path = ws / "04_产出" / f"流转状态回填计划_{date_tag}.json"
+    final_flow_path.parent.mkdir(parents=True, exist_ok=True)
+    final_flow_path.write_text(
+        json.dumps(final_flow_plan, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     flow_args = [
-        "--plan", flow_plan,
+        "--plan", str(final_flow_path),
         "--workspace", str(args.workspace),
-        "--report", str(ws / "04_产出" / f"流转变更清单_{date_tag}.xlsx"),
+        "--phase", "status",
+        "--report", str(ws / "04_产出" / f"流转状态变更清单_{date_tag}.xlsx"),
     ]
     if args.flow_in_place:
         flow_args.append("--in-place")

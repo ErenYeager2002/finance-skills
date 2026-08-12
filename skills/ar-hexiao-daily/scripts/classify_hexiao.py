@@ -1465,6 +1465,30 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
             str(x.get("sod") or "").strip() for x in lines
             if str(x.get("sod") or "").strip()
         })
+        # SO 级计提闸需要知道该 SO 下每个 SOD 的最新本币交付额。这里一次性
+        # 随订单明细固化，后续不得用盈亏表旧应收或 SO/SOD 编号反推。
+        sod_delivery_local: Dict[str, float] = {}
+        for one_line in lines:
+            one_sod = str(one_line.get("sod") or "").strip()
+            one_delivery = common.to_number(one_line.get("deliver"))
+            if not one_sod or one_delivery is None:
+                continue
+            if has_itemized_writeoff:
+                one_local, _ = _writeoff_business_amount(
+                    one_delivery,
+                    explicit_local=business_local_by_so.get(so),
+                    explicit_orig=h,
+                )
+            else:
+                one_local, _ = _order_delivery_local(
+                    one_delivery, p, rates, order,
+                    explicit_local=business_local_by_so.get(so),
+                    explicit_orig=h,
+                )
+            if one_local is not None:
+                sod_delivery_local[one_sod] = round(
+                    sod_delivery_local.get(one_sod, 0.0) + float(one_local), 2
+                )
         fallback_partial = (
             not has_itemized_writeoff
             and so in set((p.get("_parent_fallback_allocation") or {}).get("partial_sos") or [])
@@ -1560,6 +1584,7 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
                         )
                     ),
                     default_sod_lines=default_lines,
+                    sod_delivery_local=sod_delivery_local,
                     default_match_basis=basis,
                     warning_codes=["W_DEFAULT_FIRST_SOD"],
                 ))
@@ -1625,6 +1650,7 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
                     "deliver_local": deliver_local,
                     "so_delivery_local": so_delivery_local,
                     "all_sods": all_sods,
+                    "sod_delivery_local": sod_delivery_local,
                     "cumulative_received_local": cumulative_local,
                     "cumulative_detail_local": detail_cumulative_local.get(so),
                     "cumulative_fallback_local": fallback_history_local.get(so),
@@ -1716,6 +1742,7 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
                 "deliver_local": deliver_local,
                 "so_delivery_local": so_delivery_local,
                 "all_sods": all_sods,
+                "sod_delivery_local": sod_delivery_local,
                 "cumulative_received_local": cumulative_local,
                 "cumulative_detail_local": detail_cumulative_local.get(so),
                 "cumulative_fallback_local": fallback_history_local.get(so),
@@ -2202,6 +2229,11 @@ def classify_one(
                 str(x or "").strip() for x in (rec.get("all_sods") or [])
                 if str(x or "").strip()
             }),
+            "sod_delivery_local": {
+                str(key or "").strip(): round(float(common.to_number(value)), 2)
+                for key, value in (rec.get("sod_delivery_local") or {}).items()
+                if str(key or "").strip() and common.to_number(value) is not None
+            },
             "writeoff_sequence_key": rec.get("writeoff_sequence_key"),
         },
     }
@@ -3290,6 +3322,7 @@ def _expand_ambiguous_sod_waterfall(
                 item["existing_received"] + item["allocated_local"], 2
             ),
             "itemized_cumulative_authoritative": False,
+            "all_sods": sorted((rec.get("sod_delivery_local") or {}).keys()),
             "so_all_lines": rec.get("default_sod_lines") or [],
             "preferred_ledger_row": item["row"],
             "warning_codes": warnings,
@@ -3307,6 +3340,239 @@ def _expand_ambiguous_sod_waterfall(
         })
         expanded.append(resolved)
     return expanded
+
+
+def _clear_new_accrual(result: dict) -> None:
+    """SO 尚未全部结清时，只撤销本批将要新增的计提，不改历史已填值。"""
+    if result.get("code") != "OK_ALREADY_SETTLED":
+        five = result.get("five_cols") or {}
+        if five:
+            five["计提"] = None
+        result["derived_cols"] = {}
+
+    op = result.get("row_operation") or {}
+    op_type = op.get("type")
+    if op_type == "split_payment_chain":
+        for step in op.get("steps") or []:
+            (step.get("five_cols") or {})["计提"] = None
+            step["derived_cols"] = {}
+    elif op_type in {"settlement_tail_aggregate", "same_so_multi_sod_aggregate"}:
+        (op.get("target_five_cols") or {})["计提"] = None
+        op["target_derived_cols"] = {}
+
+
+def _planned_settled_sods(result: dict) -> set[str]:
+    """返回该计划写完后能被证明已结清的 SOD；拆分后仍有承接行则不算。"""
+    if result.get("bucket") != "auto":
+        return set()
+    op = result.get("row_operation") or {}
+    op_type = op.get("type")
+    if op_type == "split_below":
+        return set()
+    if op_type == "split_payment_chain":
+        if op.get("final_unpaid"):
+            return set()
+        return {
+            str(step.get("sod") or result.get("sod") or "").strip()
+            for step in (op.get("steps") or [])
+            if step.get("settled")
+            and str(step.get("sod") or result.get("sod") or "").strip()
+        }
+    if op_type == "same_so_multi_sod_aggregate":
+        target = op.get("target_five_cols") or {}
+        if target.get("是否结账") == "是":
+            return {
+                str(sod or "").strip() for sod in (op.get("member_sods") or [])
+                if str(sod or "").strip()
+            }
+        return set()
+    if (result.get("five_cols") or {}).get("是否结账") == "是":
+        sod = str(result.get("sod") or "").strip()
+        return {sod} if sod else set()
+    return set()
+
+
+def _has_new_planned_accrual(result: dict, sod: str) -> bool:
+    """历史幂等行不算“本批会写计提”；它可能正是需要补填的旧行。"""
+    if result.get("bucket") != "auto" or result.get("code") == "OK_ALREADY_SETTLED":
+        return False
+    op = result.get("row_operation") or {}
+    if op.get("type") == "split_payment_chain":
+        return any(
+            str(step.get("sod") or result.get("sod") or "").strip() == sod
+            and common.to_number((step.get("five_cols") or {}).get("计提")) is not None
+            for step in (op.get("steps") or [])
+        )
+    if op.get("type") == "same_so_multi_sod_aggregate":
+        return sod in set(op.get("member_sods") or []) and common.to_number(
+            (op.get("target_five_cols") or {}).get("计提")
+        ) is not None
+    return (
+        str(result.get("sod") or "").strip() == sod
+        and common.to_number((result.get("five_cols") or {}).get("计提")) is not None
+    )
+
+
+def _apply_so_accrual_gate(
+    results: List[dict], ledger: Optional[LedgerIndex], tolerance: float
+) -> None:
+    """
+    同一 SO 有多个 SOD 时，只有全部 SOD 结清才允许计提。
+
+    最后一个 SOD 结清的同批计划还会携带历史补填：此前已结清但计提为空的
+    SOD，只在其最后一条已结清业务行补一次计提；校验和写入层会再次逐行复核。
+    """
+    if ledger is None:
+        return
+    by_so: Dict[str, List[dict]] = {}
+    for result in results:
+        so = str(result.get("so") or "").strip()
+        if so:
+            by_so.setdefault(so, []).append(result)
+
+    for so, group in by_so.items():
+        all_sods: set[str] = set()
+        delivery_by_sod: Dict[str, float] = {}
+        for result in group:
+            source = result.get("split_payment_source") or {}
+            all_sods.update(
+                str(sod or "").strip() for sod in (source.get("all_sods") or [])
+                if str(sod or "").strip()
+            )
+            for sod, amount in (source.get("sod_delivery_local") or {}).items():
+                sod_s = str(sod or "").strip()
+                amount_n = common.to_number(amount)
+                if sod_s and amount_n is not None:
+                    delivery_by_sod[sod_s] = round(float(amount_n), 2)
+            # 兼容直接构造的单元测试/人工计划：每条 SOD record 自身的最新
+            # 交付额也是智云证据，可与同批其它 SOD 拼成完整映射。
+            result_sod = str(result.get("sod") or "").strip()
+            result_delivery = common.to_number(source.get("delivery_local"))
+            if result_sod and result_delivery is not None:
+                delivery_by_sod[result_sod] = round(float(result_delivery), 2)
+
+        # 单 SOD 继续沿用原有逐单计提规则；没有完整 SOD 清单时也不得猜测。
+        if len(all_sods) <= 1:
+            continue
+
+        planned_settled: set[str] = set()
+        for result in group:
+            planned_settled.update(_planned_settled_sods(result))
+
+        unsettled: List[str] = []
+        missing_delivery = sorted(sod for sod in all_sods if sod not in delivery_by_sod)
+        for sod in sorted(all_sods):
+            same_sod_results = [
+                result for result in group
+                if str(result.get("sod") or "").strip() == sod
+            ]
+            if any(result.get("bucket") != "auto" for result in same_sod_results):
+                unsettled.append(sod)
+                continue
+            if sod in planned_settled:
+                continue
+            if ledger.settled_without_open_row(so, sod) is None:
+                unsettled.append(sod)
+
+        all_settled = not unsettled and not missing_delivery
+        audit = {
+            "rule": "all_sods_under_so_before_accrual",
+            "so": so,
+            "all_sods": sorted(all_sods),
+            "settled_sods": sorted(all_sods - set(unsettled)),
+            "unsettled_sods": sorted(set(unsettled)),
+            "missing_delivery_sods": missing_delivery,
+            "all_settled": all_settled,
+        }
+        for result in group:
+            result["so_accrual_audit"] = dict(audit)
+
+        if not all_settled:
+            for result in group:
+                _clear_new_accrual(result)
+                warnings = list(result.get("warning_codes") or [])
+                if "W_SO_ACCRUAL_DEFERRED" not in warnings:
+                    warnings.append("W_SO_ACCRUAL_DEFERRED")
+                result["warning_codes"] = warnings
+                detail = sorted(set(unsettled) | set(missing_delivery))
+                result["reason"] = (
+                    f"{result.get('reason') or '核销命中'}；同一 SO 尚有 SOD 未全部结清或缺少交付额"
+                    f"（{','.join(detail) or '-'}），本批计提暂不填写"
+                )
+            continue
+
+        aggregate_sods: set[str] = set()
+        for result in group:
+            op = result.get("row_operation") or {}
+            if op.get("type") == "same_so_multi_sod_aggregate":
+                aggregate_sods.update(str(x or "").strip() for x in op.get("member_sods") or [])
+
+        backfills: List[dict] = []
+        for sod in sorted(all_sods):
+            if sod in aggregate_sods or any(
+                _has_new_planned_accrual(result, sod) for result in group
+            ):
+                continue
+            business_rows = ledger.business_rows(so, sod)
+            settled_rows = [
+                row_no for row_no in business_rows
+                if str((ledger.row_snapshot.get(row_no) or {}).get("jiezhang") or "").strip() == "是"
+            ]
+            if not settled_rows:
+                continue
+            target_row = max(settled_rows)
+            snap = ledger.row_snapshot.get(target_row) or {}
+            target_accrual = round(float(delivery_by_sod[sod]), 2)
+            existing_accrual = common.to_number(snap.get("jiti"))
+            if (
+                existing_accrual is not None
+                and abs(float(existing_accrual) - target_accrual) <= max(tolerance, TOL)
+            ):
+                continue
+            receivables = [
+                common.to_number((ledger.row_snapshot.get(row_no) or {}).get("yingshou"))
+                for row_no in business_rows
+            ]
+            baseline = (
+                round(sum(float(value) for value in receivables if value is not None), 2)
+                if any(value is not None for value in receivables) else None
+            )
+            difference = (
+                round(float(baseline) - target_accrual, 2)
+                if baseline is not None
+                and abs(float(baseline) - target_accrual) > max(tolerance, TOL)
+                else None
+            )
+            backfills.append({
+                "so": so,
+                "sod": sod,
+                "ledger_row_ref": int(target_row),
+                "business_rows": [int(row_no) for row_no in business_rows],
+                "accrual": target_accrual,
+                "difference": difference,
+                "current_accrual": snap.get("jiti"),
+                "current_difference": snap.get("chayi"),
+            })
+
+        carriers = [
+            result for result in group
+            if result.get("bucket") == "auto" and result.get("ledger_row_ref") is not None
+            and not result.get("same_so_multi_sod_absorbed")
+            and not result.get("tail_tolerance_absorbed")
+        ]
+        if backfills and carriers:
+            carrier = carriers[-1]
+            carrier["so_accrual_backfills"] = backfills
+            carrier["so_accrual_audit"] = {**audit, "backfill_count": len(backfills)}
+            carrier["reason"] = (
+                f"{carrier.get('reason') or '核销命中'}；同一 SO 的全部 SOD 已结清，"
+                f"同步补填此前 {len(backfills)} 个已结清 SOD 的计提"
+            )
+        for result in group:
+            warnings = list(result.get("warning_codes") or [])
+            if "W_SO_ALL_SODS_SETTLED_ACCRUAL_RELEASED" not in warnings:
+                warnings.append("W_SO_ALL_SODS_SETTLED_ACCRUAL_RELEASED")
+            result["warning_codes"] = warnings
 
 
 def classify_records(
@@ -3496,6 +3762,10 @@ def classify_records(
                 f"无法建立安全的逐笔分笔回款链：{chain_error}"
             )
             r["five_cols"] = {}
+
+    # 行冲突、分笔链和同 SO 多 SOD 合并均已定型后，再执行 SO 级计提闸。
+    # 这样判断依据是本批最终会落表的状态，不会被单条 classify_one 的中间态误导。
+    _apply_so_accrual_gate(results, ledger, max(thr, TOL))
 
     auto = [r for r in results if r["bucket"] == "auto"]
     hold = [r for r in results if r["bucket"] == "hold"]

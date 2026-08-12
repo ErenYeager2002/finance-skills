@@ -23,7 +23,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
@@ -223,6 +223,48 @@ class FlowLedger:
             return existing or ""
         parts = ([existing.strip()] if existing and existing.strip() else []) + add
         return "\n".join(parts)
+
+    @staticmethod
+    def suggest_order_amount_cell(
+        so_amounts: Sequence[Tuple[str, Optional[float]]], existing: str = ""
+    ) -> str:
+        """生成「SO  交付金额」文本；每个 SO 独占一行，已有其它订单保持不动。"""
+        ordered: List[Tuple[str, Optional[float]]] = []
+        seen = set()
+        for so, amount in so_amounts:
+            so = str(so or "").strip()
+            if not so or so in seen:
+                continue
+            seen.add(so)
+            ordered.append((so, amount))
+
+        lines = [x.strip() for x in str(existing or "").replace("\r", "").split("\n") if x.strip()]
+        result: List[str] = []
+        consumed = set()
+        for line in lines:
+            matched = None
+            for so, amount in ordered:
+                if re.search(rf"(?<![A-Z0-9]){re.escape(so)}(?![A-Z0-9])", line, re.I):
+                    matched = (so, amount)
+                    break
+            if matched is None:
+                result.append(line)
+                continue
+            so, amount = matched
+            if so in consumed:
+                continue
+            consumed.add(so)
+            result.append(FlowLedger._format_so_amount(so, amount))
+        for so, amount in ordered:
+            if so not in consumed:
+                result.append(FlowLedger._format_so_amount(so, amount))
+        return "\n".join(result)
+
+    @staticmethod
+    def _format_so_amount(so: str, amount: Optional[float]) -> str:
+        if amount is None:
+            return so
+        return f"{so}  {float(amount):,.2f}"
 
 
 def derive_flow_status(so_states: Sequence[str]) -> str:

@@ -711,6 +711,98 @@ def resolve_split_chain_row(item: dict, rows: Dict[int, dict]) -> tuple[Optional
     return resolve_item_row(item, rows)
 
 
+def _check_so_accrual_backfills(item: dict, rows: Dict[int, dict]) -> dict:
+    """逐行复核 SO 全 SOD 结清后要补填的历史计提。"""
+    checked: List[dict] = []
+    write_count = 0
+    for source in item.get("so_accrual_backfills") or []:
+        entry = dict(source)
+        ref = entry.get("ledger_row_ref")
+        so = str(entry.get("so") or "").strip()
+        sod = str(entry.get("sod") or "").strip()
+        accrual = common.to_number(entry.get("accrual"))
+        reason = ""
+        verdict = "skip"
+        row = rows.get(int(ref)) if ref is not None else None
+        if ref is None or row is None:
+            verdict, reason = "conflict", f"历史计提补填行 {ref!r} 不存在"
+        elif not _matches_identity(row, so, sod):
+            verdict, reason = (
+                "conflict",
+                f"历史计提补填第 {ref} 行身份变化：表里={row.get('SO')}/{row.get('SOD')}，计划={so}/{sod}",
+            )
+        elif accrual is None:
+            verdict, reason = "conflict", f"历史计提补填第 {ref} 行缺少有效交付金额"
+        else:
+            same_business_rows = [
+                row_no for row_no, current in rows.items()
+                if current.get("SO") == so and current.get("SOD") == sod
+            ]
+            if not same_business_rows or any(
+                str(rows[row_no].get("是否结账") or "").strip() != "是"
+                for row_no in same_business_rows
+            ):
+                verdict, reason = (
+                    "conflict",
+                    f"{so}/{sod} 仍存在未结账业务行，禁止补计提",
+                )
+            elif int(ref) != max(same_business_rows):
+                verdict, reason = (
+                    "conflict",
+                    f"历史计提必须写在 {so}/{sod} 最后一条已结清业务行 {max(same_business_rows)}，计划却是 {ref}",
+                )
+            else:
+                current_accrual = common.to_number(row.get("计提"))
+                if current_accrual is not None and abs(float(current_accrual) - float(accrual)) > 0.011:
+                    verdict, reason = (
+                        "conflict",
+                        f"第 {ref} 行计提已有值 {current_accrual}，与智云交付额 {float(accrual):.2f} 不一致，禁止覆盖",
+                    )
+                else:
+                    needs_write = current_accrual is None
+                    difference = common.to_number(entry.get("difference"))
+                    if entry.get("difference") is not None:
+                        if difference is None:
+                            verdict, reason = "conflict", f"第 {ref} 行差异不是有效数字"
+                        elif not row.get("_差异列存在"):
+                            verdict, reason = "conflict", f"第 {ref} 行需要写差异，但盈亏表没有差异列"
+                        else:
+                            current_difference = common.to_number(row.get("差异"))
+                            if (
+                                current_difference is not None
+                                and abs(float(current_difference) - float(difference)) > 0.011
+                            ):
+                                verdict, reason = (
+                                    "conflict",
+                                    f"第 {ref} 行差异已有值 {current_difference}，与计划 {float(difference):.2f} 不一致，禁止覆盖",
+                                )
+                            elif current_difference is None:
+                                needs_write = True
+                    if verdict != "conflict":
+                        verdict = "write" if needs_write else "skip"
+                        reason = (
+                            "SO 下全部 SOD 已结清，补填历史计提"
+                            if needs_write else "历史计提已与智云交付额一致"
+                        )
+        entry["_check"] = {"verdict": verdict, "reason": reason}
+        checked.append(entry)
+        if verdict == "conflict":
+            item["so_accrual_backfills"] = checked + [
+                dict(rest) for rest in (item.get("so_accrual_backfills") or [])[len(checked):]
+            ]
+            return {"verdict": "conflict", "reason": reason}
+        if verdict == "write":
+            write_count += 1
+    item["so_accrual_backfills"] = checked
+    return {
+        "verdict": "write" if write_count else "skip",
+        "reason": (
+            f"另有 {write_count} 条历史 SOD 计提需要补填"
+            if write_count else "无需补填历史 SOD 计提"
+        ),
+    }
+
+
 def check_one(item: dict, rows: Dict[int, dict]) -> dict:
     """
     单条复核 → {verdict: write|skip|conflict, reason}
@@ -1004,6 +1096,15 @@ def validate(
                     it["_relocated_from"] = int(original_ref)
                     it["ledger_row_ref"] = int(resolved_ref)
                 res = check_one(it, rows)
+        if it.get("so_accrual_backfills"):
+            backfill_res = _check_so_accrual_backfills(it, rows)
+            if backfill_res["verdict"] == "conflict":
+                res = backfill_res
+            elif backfill_res["verdict"] == "write" and res["verdict"] != "conflict":
+                res = {
+                    "verdict": "write",
+                    "reason": f"{res.get('reason') or ''}；{backfill_res['reason']}".strip("；"),
+                }
         ref = it.get("ledger_row_ref")
         # 合法分笔回款链允许多个父 AR 计划共享同一个源行；写入层会为每一笔创建
         # 独立业务行。没有同一链标记的重复行仍然冲突。

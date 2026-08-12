@@ -155,11 +155,86 @@ def _group_by(items: List[dict], key: str) -> Dict[str, List[dict]]:
     return g
 
 
+def _color_rgb(run) -> str:
+    font = getattr(run, "font", None)
+    color = getattr(font, "color", None)
+    rgb = getattr(color, "rgb", None)
+    return str(rgb or "").upper() if rgb and str(rgb) != "Values must be of type <class 'str'>" else ""
+
+
+def _rich_signature(value) -> List[Tuple[str, str]]:
+    """把 openpyxl 富文本转成可比较的 (文本, ARGB) 段。"""
+    raw: List[Tuple[str, str]] = []
+    if hasattr(value, "runs"):
+        raw = [(str(run.text), str(run.color or "").upper()) for run in value.runs]
+    elif isinstance(value, str) or value is None:
+        raw = [(str(value or ""), "")]
+    else:
+        try:
+            for run in value:
+                if isinstance(run, str):
+                    raw.append((run, ""))
+                else:
+                    raw.append((str(getattr(run, "text", run)), _color_rgb(run)))
+        except TypeError:
+            raw = [(str(value or ""), "")]
+    merged: List[Tuple[str, str]] = []
+    for text, color in raw:
+        color = "FFFF0000" if color.endswith("FF0000") else color
+        if merged and merged[-1][1] == color:
+            merged[-1] = (merged[-1][0] + text, color)
+        else:
+            merged.append((text, color))
+    return merged
+
+
+def _line_colors(value) -> Dict[str, str]:
+    """按行内 SO 建立颜色映射，用于保留不属于本批订单的已有标记。"""
+    import re
+
+    result: Dict[str, str] = {}
+    for text, color in _rich_signature(value):
+        for line in text.replace("\r", "").split("\n"):
+            for so in re.findall(r"(?<![A-Z0-9])(SO[A-Z0-9]+)(?![A-Z0-9])", line, re.I):
+                if color:
+                    result[so.upper()] = color
+                else:
+                    result.setdefault(so.upper(), "")
+    return result
+
+
+def _desired_order_value(item: dict, current, phase: str, xlsx_patch):
+    """生成本阶段单号格值；前置阶段保留旧颜色，状态阶段只改本批 SO 的颜色。"""
+    import re
+
+    text = str(item.get("order_suggest") or "").strip()
+    old_colors = _line_colors(current)
+    target = {str(x).upper() for x in (item.get("so_list") or [])}
+    red = {str(x).upper() for x in (item.get("red_sos") or [])}
+    lines = text.replace("\r", "").split("\n") if text else []
+    runs = []
+    for index, line in enumerate(lines):
+        sos = [x.upper() for x in re.findall(r"(?<![A-Z0-9])(SO[A-Z0-9]+)(?![A-Z0-9])", line, re.I)]
+        color = ""
+        if phase == "status" and any(so in target for so in sos):
+            color = "FFFF0000" if any(so in red for so in sos) else ""
+        else:
+            for so in sos:
+                if old_colors.get(so):
+                    color = old_colors[so]
+                    break
+        runs.append(xlsx_patch.RichTextRun(line + ("\n" if index < len(lines) - 1 else ""), color))
+    if any(run.color for run in runs):
+        return xlsx_patch.RichTextValue(tuple(runs))
+    return text
+
+
 def write_flow_items(
     workspace: Path,
     items: List[dict],
     *,
     in_place: bool,
+    phase: str = "all",
 ) -> Tuple[List[dict], List[str]]:
     """
     写入 write 项。返回 (changes, problems)。
@@ -197,7 +272,8 @@ def write_flow_items(
             continue
 
         # 读列位置
-        wb = openpyxl.load_workbook(str(src), read_only=True, data_only=True)
+        # openpyxl 的 read_only 模式会把富文本降成纯字符串，无法保留既有红字。
+        wb = openpyxl.load_workbook(str(src), read_only=False, data_only=True, rich_text=True)
         # 按 sheet 分组
         by_sheet: Dict[str, List[dict]] = {}
         for it in group:
@@ -251,13 +327,17 @@ def write_flow_items(
                         x.strip() for x in str(s).replace("\r", "").split("\n") if x.strip()
                     )
 
-                same_order = _norm_lines(_cur(cols["单号"])) == _norm_lines(order_v)
+                current_order = cur_vals[cols["单号"]] if cols["单号"] < len(cur_vals) else ""
+                desired_order = _desired_order_value(it, current_order, phase, xlsx_patch)
+                same_order = _norm_lines(str(current_order or "")) == _norm_lines(order_v)
+                if phase == "status":
+                    same_order = same_order and _rich_signature(current_order) == _rich_signature(desired_order)
                 same_upd = _cur(cols["是否更新应收款"]) == upd_v
 
-                did_order = bool(write_order and order_v and not same_order)
+                did_order = bool(phase in ("all", "prefill", "status") and write_order and order_v and not same_order)
                 if did_order:
-                    edits.append((r, col_order, order_v))
-                do_upd = bool(write_updated and not same_upd)
+                    edits.append((r, col_order, desired_order))
+                do_upd = bool(phase in ("all", "status") and write_updated and not same_upd)
                 if do_upd:
                     edits.append((r, col_upd, upd_v))
                 if not did_order and not do_upd:
@@ -272,6 +352,8 @@ def write_flow_items(
                         "row_no": r,
                         "单号": order_v if did_order else "(未改)",
                         "是否更新应收款": upd_v if write_updated else "(未改)",
+                        "阶段": phase,
+                        "未核销标红SO": "、".join(it.get("red_sos") or []),
                     }
                 )
             all_edits_by_sheet[sheet_name] = edits
@@ -311,7 +393,7 @@ def write_flow_items(
             )
             # 回读校验（本文件局部问题）
             local_problems: List[str] = []
-            wb2 = openpyxl.load_workbook(str(current), read_only=True, data_only=True)
+            wb2 = openpyxl.load_workbook(str(current), read_only=False, data_only=True, rich_text=True)
             for sheet_name, g2 in by_sheet.items():
                 if sheet_name not in wb2.sheetnames:
                     local_problems.append(f"回读缺 sheet {sheet_name}")
@@ -325,7 +407,8 @@ def write_flow_items(
                         local_problems.append(f"{it.get('ar')}: 回读行越界 {r}")
                         continue
                     vals = list(rows[r - 1])
-                    got_order = str(vals[cols["单号"]] or "").strip() if cols["单号"] < len(vals) else ""
+                    got_order_value = vals[cols["单号"]] if cols["单号"] < len(vals) else ""
+                    got_order = str(got_order_value or "").strip()
                     got_upd = (
                         str(vals[cols["是否更新应收款"]] or "").strip()
                         if cols["是否更新应收款"] < len(vals)
@@ -354,10 +437,17 @@ def write_flow_items(
                         local_problems.append(
                             f"{it.get('ar')} 单号回读不符：期望 {exp_order!r} 实际 {got_order!r}"
                         )
-                    if wu and got_upd != exp_upd:
+                    if phase in ("all", "status") and wu and got_upd != exp_upd:
                         local_problems.append(
                             f"{it.get('ar')} 是否更新回读不符：期望 {exp_upd!r} 实际 {got_upd!r}"
                         )
+                    if phase == "status":
+                        colors = _line_colors(got_order_value)
+                        red = {str(x).upper() for x in (it.get("red_sos") or [])}
+                        for so in (it.get("so_list") or []):
+                            is_red = colors.get(str(so).upper(), "").endswith("FF0000")
+                            if is_red != (str(so).upper() in red):
+                                local_problems.append(f"{it.get('ar')} {so} 红字回读不符")
             wb2.close()
 
             n_ok = len(group)
@@ -401,7 +491,7 @@ def write_change_report(changes: List[dict], path: Path) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "流转变更清单"
-    headers = ["ar", "file", "sheet", "row_no", "单号", "是否更新应收款"]
+    headers = ["ar", "file", "sheet", "row_no", "阶段", "单号", "是否更新应收款", "未核销标红SO"]
     ws.append(headers)
     for c in ws[1]:
         c.font = Font(bold=True)
@@ -425,6 +515,10 @@ def main(argv=None) -> int:
         help="已废弃的兼容参数；现在日清与写前校验通过后可直接写入",
     )
     ap.add_argument("--in-place", action="store_true", help="就地写 02_ 里的流转副本")
+    ap.add_argument(
+        "--phase", choices=("all", "prefill", "status"), default="all",
+        help="all=兼容旧流程；prefill=只写SO与交付金额；status=核销后回填状态及红字",
+    )
     ap.add_argument("--report", default="")
     args = ap.parse_args(argv)
 
@@ -445,7 +539,7 @@ def main(argv=None) -> int:
         print(f"流转变更清单 → {report}")
         return 0
 
-    changes, problems = write_flow_items(ws, items, in_place=args.in_place)
+    changes, problems = write_flow_items(ws, items, in_place=args.in_place, phase=args.phase)
     write_change_report(changes, report)
     print(f"流转变更清单 → {report}")
 
