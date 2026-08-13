@@ -22,6 +22,7 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import common  # noqa: E402
+import workbook_finalize  # noqa: E402
 
 HEADERS = [
     "案例ID",   # = AR|SO：一笔到账挂多个 SO 时每个 SO 独立跟踪，否则状态互相覆盖
@@ -126,6 +127,7 @@ def save_ledger(path: Path, rows: List[dict]) -> None:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
+    workbook_finalize.finalize_static_report(path)
 
 
 def revisit_condition(code: str) -> str:
