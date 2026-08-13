@@ -49,8 +49,9 @@ def test_build_task_reports_creates_three_static_range_files(tmp_path):
         assert audit.full_calc_on_load == "0"
         assert audit.force_full_calc == "0"
         checker = Path(r"D:\BESTEASY\03_tools\scripts\xlsx_lightweight_audit.py")
-        checked = subprocess.run(
-            [sys.executable, str(checker), str(path), "--strict"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        assert checked.returncode == 0, checked.stdout + checked.stderr
+        if checker.is_file():
+            checked = subprocess.run(
+                [sys.executable, str(checker), str(path), "--strict"],
+                capture_output=True, text=True, encoding="utf-8",
+            )
+            assert checked.returncode == 0, checked.stdout + checked.stderr

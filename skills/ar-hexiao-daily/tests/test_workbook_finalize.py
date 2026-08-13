@@ -212,7 +212,14 @@ def test_finalize_rejects_formula_without_cached_value(tmp_path):
 
     def remove_cache(payload):
         sheet = payload["xl/worksheets/sheet1.xml"].decode("utf-8")
-        sheet = re.sub(r'(<c r="C1"[^>]*><f>.*?</f>)<v>.*?</v>', r'\1', sheet)
+        cell_match = re.search(r'<c\b[^>]*\br="C1"[^>]*>.*?</c>', sheet, re.S)
+        assert cell_match is not None
+        cell, removed = re.subn(
+            r'<v\b[^>]*(?:/>|>.*?</v>)', "", cell_match.group(0),
+            count=1, flags=re.S,
+        )
+        assert removed == 1
+        sheet = sheet[:cell_match.start()] + cell + sheet[cell_match.end():]
         payload["xl/worksheets/sheet1.xml"] = sheet.encode("utf-8")
 
     _rewrite(source, remove_cache)
