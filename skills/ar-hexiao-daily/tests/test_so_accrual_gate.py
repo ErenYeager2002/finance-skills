@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """同一 SO 多 SOD：全部结清后才计提，并补填历史已结清行。"""
 import datetime as dt
+import json
 
 import openpyxl
 
@@ -66,16 +67,14 @@ def test_last_sod_releases_current_accrual_and_backfills_prior_sod():
     item = result["auto"][0]
 
     assert item["five_cols"]["计提"] == 200.0
-    assert item["so_accrual_backfills"] == [{
-        "so": "SO1",
-        "sod": "SOD1",
-        "ledger_row_ref": 2,
-        "business_rows": [2],
-        "accrual": 100.0,
-        "difference": None,
-        "current_accrual": None,
-        "current_difference": None,
-    }]
+    backfill = item["so_accrual_backfills"][0]
+    assert backfill["so"] == "SO1"
+    assert backfill["sod"] == "SOD1"
+    assert backfill["ledger_row_ref"] == 2
+    assert backfill["business_rows"] == [2]
+    assert backfill["accrual"] == 100.0
+    assert backfill["current_batch_sods"] == ["SOD2"]
+    assert backfill["all_sods"] == ["SOD1", "SOD2"]
 
 
 def test_backfill_uses_only_last_settled_business_row_of_split_sod():
@@ -134,3 +133,101 @@ def test_validate_apply_readback_and_rerun_are_idempotent(tmp_path):
     assert not rerun_plan["auto"][0].get("so_accrual_backfills")
     rerun_checked = V.validate(rerun_plan, V.read_ledger_rows(output_path))
     assert rerun_checked["counts"] == {"write": 0, "skip": 1, "conflict": 0}
+
+
+def _result_with_backfill():
+    notice_item = {
+        "so": "SO1",
+        "sod": "SOD2",
+        "ledger_year": 2026,
+        "so_accrual_audit": {
+            "all_settled": True,
+            "all_sods": ["SOD1", "SOD2"],
+            "current_batch_sods": ["SOD2"],
+        },
+        "so_accrual_backfills": [{
+            "so": "SO1", "sod": "SOD1", "ledger_row_ref": 2,
+            "accrual": 100.0, "difference": None, "current_accrual": None,
+            "historical_receipt_time": "2026-07-20", "ledger_year": 2026,
+        }],
+    }
+    return {"auto": [notice_item], "hold": [], "exception": []}
+
+
+def test_cross_month_notice_uses_prior_result_real_writeoff_date(tmp_path):
+    out = tmp_path / "04_产出"
+    out.mkdir()
+    (out / "判定结果_20260722.json").write_text(json.dumps({
+        "hexiao_date": "2026-07-22",
+        "auto": [{"so": "SO1", "sod": "SOD1"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    result = _result_with_backfill()
+
+    notices = C.annotate_cross_month_accruals(
+        result, tmp_path, dt.date(2026, 8, 12)
+    )
+
+    assert len(notices) == 1
+    assert notices[0]["historical_hexiao_dates"] == ["2026-07-22"]
+    assert notices[0]["historical_hexiao_months"] == ["2026-07"]
+    assert notices[0]["cross_month_status"] == "是"
+    assert notices[0]["history_source"] == "历史核销日清"
+    nested = result["auto"][0]["so_accrual_backfills"][0]
+    assert nested["cross_month_accrual_notice"]["historical_sod"] == "SOD1"
+
+
+def test_same_month_prior_result_does_not_create_cross_month_notice(tmp_path):
+    out = tmp_path / "04_产出"
+    out.mkdir()
+    (out / "判定结果_20260805.json").write_text(json.dumps({
+        "hexiao_date": "2026-08-05",
+        "auto": [{"so": "SO1", "sod": "SOD1"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    result = _result_with_backfill()
+
+    notices = C.annotate_cross_month_accruals(
+        result, tmp_path, dt.date(2026, 8, 12)
+    )
+
+    assert notices == []
+
+
+def test_missing_prior_result_uses_ledger_receipt_time_for_cross_month(tmp_path):
+    (tmp_path / "04_产出").mkdir()
+    result = _result_with_backfill()
+
+    notices = C.annotate_cross_month_accruals(
+        result, tmp_path, dt.date(2026, 8, 12)
+    )
+
+    assert len(notices) == 1
+    assert notices[0]["historical_hexiao_dates"] == ["2026-07-20"]
+    assert notices[0]["historical_hexiao_months"] == ["2026-07"]
+    assert notices[0]["cross_month_status"] == "是"
+    assert notices[0]["history_source"] == "盈亏核算表收款时间"
+
+
+def test_missing_prior_result_same_month_receipt_is_not_cross_month(tmp_path):
+    (tmp_path / "04_产出").mkdir()
+    result = _result_with_backfill()
+    result["auto"][0]["so_accrual_backfills"][0]["historical_receipt_time"] = "2026-08-05"
+
+    notices = C.annotate_cross_month_accruals(
+        result, tmp_path, dt.date(2026, 8, 12)
+    )
+
+    assert notices == []
+
+
+def test_missing_prior_result_and_receipt_time_stays_pending(tmp_path):
+    (tmp_path / "04_产出").mkdir()
+    result = _result_with_backfill()
+    result["auto"][0]["so_accrual_backfills"][0]["historical_receipt_time"] = None
+
+    notices = C.annotate_cross_month_accruals(
+        result, tmp_path, dt.date(2026, 8, 12)
+    )
+
+    assert len(notices) == 1
+    assert notices[0]["cross_month_status"] == "待确认"
+    assert notices[0]["history_source"] == "未找到历史日清及盈亏收款时间"

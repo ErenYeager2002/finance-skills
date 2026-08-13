@@ -3475,10 +3475,13 @@ def _apply_so_accrual_gate(
                 unsettled.append(sod)
 
         all_settled = not unsettled and not missing_delivery
+        current_batch_sods = sorted(planned_settled & all_sods)
         audit = {
             "rule": "all_sods_under_so_before_accrual",
             "so": so,
             "all_sods": sorted(all_sods),
+            "current_batch_sods": current_batch_sods,
+            "prior_settled_sods": sorted(all_sods - set(current_batch_sods)),
             "settled_sods": sorted(all_sods - set(unsettled)),
             "unsettled_sods": sorted(set(unsettled)),
             "missing_delivery_sods": missing_delivery,
@@ -3552,6 +3555,15 @@ def _apply_so_accrual_gate(
                 "difference": difference,
                 "current_accrual": snap.get("jiti"),
                 "current_difference": snap.get("chayi"),
+                "historical_receipt_time": common.norm_date(
+                    snap.get("shoukuan_time")
+                ),
+                "current_batch_sods": current_batch_sods,
+                "all_sods": sorted(all_sods),
+                "ledger_year": next(
+                    (result.get("ledger_year") for result in group if result.get("ledger_year")),
+                    None,
+                ),
             })
 
         carriers = [
@@ -3573,6 +3585,134 @@ def _apply_so_accrual_gate(
             if "W_SO_ALL_SODS_SETTLED_ACCRUAL_RELEASED" not in warnings:
                 warnings.append("W_SO_ALL_SODS_SETTLED_ACCRUAL_RELEASED")
             result["warning_codes"] = warnings
+
+
+def _historical_sod_writeoff_index(
+    workspace: Path, current_hexiao_date: Optional[dt.date]
+) -> Dict[Tuple[str, str], List[dict]]:
+    """从当前工作区既有日清结果读取 SO/SOD 的真实历史核销日期。"""
+    out_dir = Path(workspace) / "04_产出"
+    index: Dict[Tuple[str, str], List[dict]] = {}
+    if not out_dir.is_dir():
+        return index
+    for path in sorted(out_dir.glob("判定结果_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        history_date = common.norm_date(payload.get("hexiao_date"))
+        if history_date is None:
+            continue
+        if current_hexiao_date is not None and history_date >= current_hexiao_date:
+            continue
+        for item in payload.get("auto") or []:
+            so = str(item.get("so") or "").strip()
+            sod = str(item.get("sod") or "").strip()
+            if not so or not sod:
+                continue
+            index.setdefault((so, sod), []).append({
+                "hexiao_date": history_date.isoformat(),
+                "source": path.name,
+            })
+    return index
+
+
+def annotate_cross_month_accruals(
+    result: dict,
+    workspace: Path,
+    current_hexiao_date: Optional[dt.date],
+) -> List[dict]:
+    """
+    标出“本批结清整个 SO，并补填以前月份 SOD 计提”的使用者提示。
+
+    历史核销月份优先取当前工作区既有《判定结果》的真实核销日期。若工作区
+    缺历史日清，按业务口径直接使用盈亏表收款时间判断月份；两者都缺失才待确认。
+    """
+    history_index = _historical_sod_writeoff_index(workspace, current_hexiao_date)
+    notices: List[dict] = []
+    for item in result.get("auto") or []:
+        audit = item.get("so_accrual_audit") or {}
+        if not audit.get("all_settled"):
+            continue
+        current_sods = sorted({
+            str(sod or "").strip() for sod in (audit.get("current_batch_sods") or [])
+            if str(sod or "").strip()
+        })
+        all_sods = sorted({
+            str(sod or "").strip() for sod in (audit.get("all_sods") or [])
+            if str(sod or "").strip()
+        })
+        if not current_sods or set(current_sods) >= set(all_sods):
+            continue
+        for backfill in item.get("so_accrual_backfills") or []:
+            so = str(backfill.get("so") or item.get("so") or "").strip()
+            sod = str(backfill.get("sod") or "").strip()
+            if not so or not sod or sod in set(current_sods):
+                continue
+            evidence = history_index.get((so, sod), [])
+            dates = sorted({str(row.get("hexiao_date") or "") for row in evidence if row.get("hexiao_date")})
+            sources = sorted({str(row.get("source") or "") for row in evidence if row.get("source")})
+            exact_cross_month = bool(
+                current_hexiao_date
+                and any(
+                    (history_date := common.norm_date(value)) is not None
+                    and (history_date.year, history_date.month)
+                    != (current_hexiao_date.year, current_hexiao_date.month)
+                    for value in dates
+                )
+            )
+            receipt_date = common.norm_date(backfill.get("historical_receipt_time"))
+            receipt_cross_month = bool(
+                current_hexiao_date
+                and receipt_date
+                and (receipt_date.year, receipt_date.month)
+                != (current_hexiao_date.year, current_hexiao_date.month)
+            )
+            # 历史日清优先；缺历史日清时，按业务口径以盈亏表收款时间判断月份。
+            # 有判断日期且全部在本月时不是跨月；两种日期都缺失才列为待确认。
+            if dates and not exact_cross_month:
+                continue
+            if not dates and receipt_date and not receipt_cross_month:
+                continue
+            effective_dates = dates or (
+                [receipt_date.isoformat()] if receipt_date else []
+            )
+            month_status = "是" if (exact_cross_month or receipt_cross_month) else "待确认"
+            history_source = (
+                "历史核销日清" if dates
+                else "盈亏核算表收款时间" if receipt_date
+                else "未找到历史日清及盈亏收款时间"
+            )
+            notice = {
+                "so": so,
+                "current_batch_sods": current_sods,
+                "historical_sod": sod,
+                "all_sods": all_sods,
+                "current_hexiao_date": (
+                    current_hexiao_date.isoformat() if current_hexiao_date else ""
+                ),
+                "historical_hexiao_dates": effective_dates,
+                "historical_hexiao_months": sorted({value[:7] for value in effective_dates}),
+                "cross_month_status": month_status,
+                "history_source": history_source,
+                "history_source_files": sources,
+                "historical_receipt_time": (
+                    receipt_date.isoformat() if receipt_date else ""
+                ),
+                "current_accrual": backfill.get("current_accrual"),
+                "planned_accrual": backfill.get("accrual"),
+                "planned_difference": backfill.get("difference"),
+                "ledger_year": backfill.get("ledger_year") or item.get("ledger_year"),
+                "ledger_row_ref": backfill.get("ledger_row_ref"),
+                "reason": (
+                    "本次核销完成后该 SO 的全部 SOD 已结清，"
+                    "因此同步补填以前已结清但计提为空的 SOD"
+                ),
+            }
+            backfill["cross_month_accrual_notice"] = dict(notice)
+            notices.append(notice)
+    result["cross_month_accrual_cases"] = notices
+    return notices
 
 
 def classify_records(
@@ -4090,6 +4230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cent_tolerance": float(amount_policy.CENT_TOLERANCE),
         "business_settlement_tolerance": BUSINESS_SETTLEMENT_TOL,
         "business_tail_policy": "keep_exact_amount_no_unpaid_row_and_absorb_tiny_parent_audit",
+        "cross_month_so_accrual_notice": "report_prior_month_sods_when_current_batch_closes_entire_so",
     }
     result["parent_fallback_allocations"] = {
         p.get("ar"): p.get("_parent_fallback_allocation")
@@ -4102,6 +4243,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ws, date_from=requested_date, date_to=requested_date
     )
     result["hexiao_date"] = hexiao_date.isoformat() if hexiao_date else ""
+    annotate_cross_month_accruals(result, ws, hexiao_date)
     stamp = hexiao_date.strftime("%Y%m%d") if hexiao_date else dt.date.today().strftime("%Y%m%d")
     out_path = Path(args.out) if args.out else (ws / "04_产出" / f"判定结果_{stamp}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
