@@ -44,7 +44,9 @@ def _row(**kw):
     base = {
         "file": "t.xlsx", "sheet": "S", "row_no": 2, "date": dt.date(2026, 7, 14),
         "company_name": "某某科技有限公司", "remitter": "",
-        "payer": "某某科技有限公司", "amount": 100.0, "order_cell": "", "form": "汇款",
+        "payer": "某某科技有限公司", "amount": 100.0,
+        "formula_orig_amount": None, "formula_rate": None,
+        "order_cell": "", "form": "汇款",
         "updated": "", "registered": "",
     }
     base.update(kw)
@@ -62,6 +64,41 @@ def test_match_uses_gross_when_fee_present():
     f = _flow([_row(amount=300.0)])
     hit = f.match(dt.date(2026, 7, 14), 298.38, "某某科技", fee=1.62)
     assert hit["hits"] == 1 and hit["matched_by"] == "三键(含手续费)"
+
+
+@pytest.mark.parametrize("form", ["PayPal", "美元户"])
+def test_match_foreign_flow_uses_original_amount_from_formula(form):
+    """流转内部汇率与智云不同，也应按公式左侧原币金额定位。"""
+    f = _flow([_row(
+        amount=10106.60,
+        amount_formula="=1443.8*7",
+        formula_orig_amount=1443.8,
+        formula_rate=7.0,
+        form=form,
+    )])
+    hit = f.match(dt.date(2026, 7, 14), 1443.8, "某某科技")
+    assert hit["hits"] == 1
+    assert hit["matched_by"] == "三键(原币公式)"
+
+
+def test_match_foreign_formula_original_amount_can_include_fee():
+    f = _flow([_row(
+        amount=2100.0,
+        amount_formula="=300*7",
+        formula_orig_amount=300.0,
+        formula_rate=7.0,
+        form="PayPal",
+    )])
+    hit = f.match(dt.date(2026, 7, 14), 298.38, "某某科技", fee=1.62)
+    assert hit["hits"] == 1
+    assert hit["matched_by"] == "三键(原币公式含手续费)"
+
+
+def test_formula_original_amount_is_strictly_limited_to_foreign_forms():
+    assert FL.formula_original_amount("=1443.8*7", "PayPal") == (1443.8, 7.0)
+    assert FL.formula_original_amount("=1443.8*7", "美元户") == (1443.8, 7.0)
+    assert FL.formula_original_amount("=1443.8*7", "汇款") == (None, None)
+    assert FL.formula_original_amount("=A1*7", "PayPal") == (None, None)
 
 
 def test_match_zero_is_e0_signal():
@@ -138,6 +175,25 @@ def test_flow_loader_keeps_company_and_remitter_as_distinct_names(tmp_path):
     assert len(flow.rows) == 1
     assert flow.rows[0]["company_name"] == "公司甲"
     assert flow.rows[0]["remitter"] == "汇款人乙"
+
+
+def test_flow_loader_reads_original_amount_from_paypal_formula(tmp_path):
+    path = tmp_path / "flow_fx.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "明细"
+    ws.append(["日期", "公司名称", "金额", "单号", "是否更新应收款", "收款形式"])
+    ws.append([dt.date(2026, 7, 14), "公司甲", "=1443.8*7", "", "", "PayPal"])
+    wb.save(path)
+    wb.close()
+
+    flow = FL.FlowLedger.from_paths([path])
+    assert len(flow.rows) == 1
+    assert flow.rows[0]["formula_orig_amount"] == 1443.8
+    assert flow.rows[0]["formula_rate"] == 7.0
+    hit = flow.match(dt.date(2026, 7, 14), 1443.8, customer="公司甲")
+    assert hit["hits"] == 1
+    assert hit["matched_by"] == "三键(原币公式)"
 
 
 def test_suggest_order_cell_appends_without_dup():

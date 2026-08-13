@@ -138,6 +138,23 @@ def test_plan_strong_write_weak_hand():
     assert plan["counts"]["hand"] >= 3
 
 
+@pytest.mark.parametrize("matched_by", ["三键(原币公式)", "三键(原币公式含手续费)"])
+def test_plan_accepts_unique_foreign_formula_match_as_strong(matched_by):
+    result = _result_with_flow_items([{
+        "ar": "AR_FX",
+        "so": "SO_FX",
+        "flow_hits": 1,
+        "flow_matched_by": matched_by,
+        "flow_file": "流转A.xlsx",
+        "flow_sheet": "明细",
+        "flow_row_no": 2,
+        "flow_order_suggest": "SO_FX",
+        "updated": "是",
+    }])
+    plan = BFP.build_plan(result)
+    assert plan["items"][0]["verdict"] == "write"
+
+
 def test_flow_plan_always_covers_all_results_without_named_so_filter():
     result = _result_with_flow_items([
         {

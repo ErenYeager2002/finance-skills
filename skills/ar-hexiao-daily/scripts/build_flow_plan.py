@@ -26,7 +26,12 @@ try:
 except Exception:
     pass
 
-STRONG = frozenset({"三键", "三键(含手续费)"})
+STRONG = frozenset({
+    "三键",
+    "三键(含手续费)",
+    "三键(原币公式)",
+    "三键(原币公式含手续费)",
+})
 _LOC_RE = re.compile(
     r"^(?P<file>.+)#(?P<sheet>.+) 第(?P<row>\d+)行（(?P<by>[^）]*)）\s*$"
 )
