@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # ── 常量（表 ID / 字段 ID 来自 2026-07-09/22/23 勘探，非密钥）────────────────
 BASE_DEFAULT = "http://192.168.10.167:18880"
 APP_ID = "6ff4fb2e-e68c-4ee9-83a0-836de8f72c11"
-EXPORT_SCHEMA_VERSION = "2026-08-11-project-delivery-date-v3"
+EXPORT_SCHEMA_VERSION = "2026-08-13-flow-sales-name-v4"
 CREDENTIAL_SERVICE = "codex.ar-hexiao-daily.zhiyun"
 
 WS_HUIKUAN = "6555d2b1f9460e517040ba6c"  # 回款记录（唯一入口）
@@ -599,6 +599,7 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
 
     hk_ctrls = client.controls(WS_HUIKUAN)
     hk_opts = client.option_maps(hk_ctrls)
+    sales_cid = client.id_by_name(hk_ctrls, "销售")
     cid_xiadan = client.id_by_name(hk_ctrls, REL_XIADAN)
     cid_jiesuan = client.id_by_name(hk_ctrls, REL_JIESUAN)
     cid_mingxi = client.id_by_name(hk_ctrls, REL_HEXIAO_MINGXI)
@@ -613,7 +614,7 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
     # ── ① 回款记录 ────────────────────────────────────────────
     hk_headers = [
         "回款记录ID", "核销日期", "到账日期", "到账金额/原币", "到账金额/本币",
-        "手续费/原币", "原币币种", "回款类型", "核销状态", "开票客户", "rowid",
+        "手续费/原币", "原币币种", "回款类型", "核销状态", "开票客户", "销售名称", "rowid",
         "仅历史累计父记录",
     ]
     hk_out: List[List[Any]] = []
@@ -634,12 +635,13 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
             "huikuan_type": htype,
             "status": _plain(row.get(F_HK["status"]), hk_opts.get(F_HK["status"])),
             "customer": _plain(row.get(F_HK["customer_txt"])) or _plain(row.get(F_HK["customer_rel"])),
+            "sales_name": _plain(row.get(sales_cid), hk_opts.get(sales_cid)) if sales_cid else "",
             "rowid": row.get("rowid") or "",
         }
         payments.append(rec)
         hk_out.append([rec[k] for k in (
             "ar", "hexiao_date", "arrival_date", "amount_orig", "amount_local",
-            "fee", "currency", "huikuan_type", "status", "customer", "rowid")] + ["否"])
+            "fee", "currency", "huikuan_type", "status", "customer", "sales_name", "rowid")] + ["否"])
 
     day_tag = day.replace("-", "")
     # ── ② 下单栏（每笔 → SO + 交付额）+ ③ 同币种核销明细 ───────
@@ -752,6 +754,7 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
             _plain(row.get(F_HK["huikuan_type"]), hk_opts.get(F_HK["huikuan_type"])),
             _plain(row.get(F_HK["status"]), hk_opts.get(F_HK["status"])),
             _plain(row.get(F_HK["customer_txt"])) or _plain(row.get(F_HK["customer_rel"])),
+            _plain(row.get(sales_cid), hk_opts.get(sales_cid)) if sales_cid else "",
             row.get("rowid") or "",
             "是",
         ])

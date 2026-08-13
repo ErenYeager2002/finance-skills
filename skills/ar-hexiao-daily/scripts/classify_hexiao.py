@@ -562,6 +562,7 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
             "到账日期", "到账金额原币", "到账金额本币",
             "手续费", "手续费本币", "税费", "税费本币", "其他费用", "其他费用本币",
             "原币币种", "回款类型", "核销状态", "开票客户",
+            "销售名称",
         ]:
             i = _col(h, "回款记录", k, aliases)
             if i is not None:
@@ -589,6 +590,7 @@ def load_exports(workspace: Path, target_date: Optional[dt.date] = None) -> List
                 "huikuan_type": str(_get(vals, c.get("回款类型")) or "").strip(),
                 "status": str(_get(vals, c.get("核销状态")) or "").strip(),
                 "customer": str(_get(vals, c.get("开票客户")) or "").strip(),
+                "sales_name": str(_get(vals, c.get("销售名称")) or "").strip(),
                 "orders": [],
                 "writeoffs": {},
                 "writeoffs_local": {},
@@ -868,6 +870,7 @@ def _hold(p: dict, code: str, reason: str, so: str = "", sod: str = "", **extra)
     rec = {
         "ar": p["ar"], "so": so, "sod": sod,
         "customer": p.get("customer") or "",
+        "sales_name": p.get("sales_name") or "",
         "amount_orig": None,
         "currency": p.get("currency") or "人民币CNY",
         "hexiao_date": p.get("hexiao_date"),
@@ -1321,6 +1324,7 @@ def expand_payment(p: dict, rates: Dict[str, float]) -> List[dict]:
             route_fields = route_fields_by_so.get(str(item.get("so") or "").strip()) or {}
             item.setdefault("delivery_date", route_fields.get("delivery_date"))
             item.setdefault("delivery_date_issue", route_fields.get("delivery_date_issue") or "")
+            item.setdefault("sales_name", p.get("sales_name") or "")
         if duplicate_audit:
             for item in items:
                 item["duplicate_writeoff_audit"] = duplicate_audit

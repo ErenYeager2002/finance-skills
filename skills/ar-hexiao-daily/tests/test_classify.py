@@ -88,6 +88,13 @@ def test_no_writeoff_means_full_settle():
     assert all("父回款总到账按交付额从小到大" in r["match_basis"] for r in recs)
 
 
+def test_expand_payment_propagates_payment_sales_name():
+    p = _pay(sales_name="销售甲")
+    recs = C.expand_payment(p, {})
+    assert recs
+    assert all(r["sales_name"] == "销售甲" for r in recs)
+
+
 def test_parent_fallback_stops_after_partial_smallest_order():
     """父回款小于最小交付额时，只给最小订单做部分回款。"""
     p = _pay(

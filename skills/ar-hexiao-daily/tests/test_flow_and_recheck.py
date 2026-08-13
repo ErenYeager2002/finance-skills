@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import openpyxl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conftest import FIXTURE, LEDGER_FULL, TEST_DATA  # noqa: E402
@@ -42,6 +43,7 @@ def _flow(rows):
 def _row(**kw):
     base = {
         "file": "t.xlsx", "sheet": "S", "row_no": 2, "date": dt.date(2026, 7, 14),
+        "company_name": "某某科技有限公司", "remitter": "",
         "payer": "某某科技有限公司", "amount": 100.0, "order_cell": "", "form": "汇款",
         "updated": "", "registered": "",
     }
@@ -74,9 +76,68 @@ def test_match_multi_is_e12_signal():
 
 def test_match_name_mismatch_is_weak_not_silent():
     """名字对不上但日期金额命中：仍返回，但标注需人工确认，不许当强命中。"""
-    f = _flow([_row(payer="完全无关公司")])
+    f = _flow([_row(company_name="完全无关公司", payer="完全无关公司")])
     hit = f.match(dt.date(2026, 7, 14), 100.0, "某某科技")
     assert hit["hits"] == 1 and hit["matched_by"] == "日期+金额(名字不符)"
+
+
+@pytest.mark.parametrize(
+    ("customer", "sales_name", "company_name", "remitter"),
+    [
+        ("", "销售甲", "销售甲有限公司", ""),
+        ("", "销售甲", "无关公司", "销售甲"),
+        ("客户乙", "", "客户乙有限公司", ""),
+        ("客户乙", "", "无关公司", "客户乙"),
+    ],
+)
+def test_match_accepts_any_zhiyun_name_against_company_or_remitter(
+    customer, sales_name, company_name, remitter
+):
+    f = _flow([_row(company_name=company_name, remitter=remitter, payer=company_name)])
+    hit = f.match(
+        dt.date(2026, 7, 14),
+        100.0,
+        customer=customer,
+        sales_name=sales_name,
+    )
+    assert hit["hits"] == 1 and hit["matched_by"] == "三键"
+
+
+def test_match_filters_date_amount_candidates_by_names_before_uniqueness():
+    f = _flow([
+        _row(row_no=2, company_name="无关甲", payer="无关甲"),
+        _row(row_no=3, company_name="目标客户有限公司", payer="目标客户有限公司"),
+    ])
+    hit = f.match(dt.date(2026, 7, 14), 100.0, customer="目标客户")
+    assert hit["hits"] == 1
+    assert hit["rows"][0]["row_no"] == 3
+
+
+def test_annotate_records_passes_sales_name_to_flow_match():
+    flow = _flow([_row(company_name="销售甲", payer="销售甲")])
+    recs = [{
+        "ar": "ARX", "so": "SOX", "shoukuan_date": dt.date(2026, 7, 14),
+        "arrival_total": 100.0, "customer": "无关客户", "sales_name": "销售甲", "fee": 0.0,
+    }]
+    FL.annotate_records(recs, flow)
+    assert recs[0]["flow_hits"] == 1
+    assert recs[0]["flow_matched_by"] == "三键"
+
+
+def test_flow_loader_keeps_company_and_remitter_as_distinct_names(tmp_path):
+    path = tmp_path / "flow.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "明细"
+    ws.append(["日期", "公司名称", "汇款人", "金额", "单号", "是否更新应收款"])
+    ws.append([dt.date(2026, 7, 14), "公司甲", "汇款人乙", 100, "", ""])
+    wb.save(path)
+    wb.close()
+
+    flow = FL.FlowLedger.from_paths([path])
+    assert len(flow.rows) == 1
+    assert flow.rows[0]["company_name"] == "公司甲"
+    assert flow.rows[0]["remitter"] == "汇款人乙"
 
 
 def test_suggest_order_cell_appends_without_dup():

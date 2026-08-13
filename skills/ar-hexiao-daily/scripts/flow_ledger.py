@@ -9,9 +9,10 @@
 设计要点
 - **按表头内容认表，不按文件名**（她各渠道分开好几张：汇款/微信/支付宝/美元户）。
 - 匹配键按可靠度排序（参考李尚 business-rules §3）：
-  1. 到账日期 + 净到账额 + 公司名/汇款人
-  2. 到账日期 + （净额 + 手续费）+ 公司名  ← 微信/支付宝把客户支付额拆成净额与手续费
-  3. 到账日期 + 金额（任一口径），公司名对不上 → **弱命中**，仍要人确认
+  1. 先按到账日期 + 净到账额筛选候选行；
+  2. 再以智云销售名称/客户名称匹配流转表公司名称/汇款人，四种组合任一成立即名称命中；
+  3. 微信/支付宝另允许到账日期 +（净额 + 手续费）按同样名称规则匹配；
+  4. 日期金额命中但四种名称组合都不成立 → **弱命中**，仍要人确认。
 - 命中 0 → E0；命中 >1 → E12；命中 1 → 给出行号与建议单号。
 - 匹配只读；**写入**见 `apply_flow.py`（确认后、仅强三键唯一命中）。
 """
@@ -34,6 +35,7 @@ import amount_policy  # noqa: E402
 _REQUIRED_HINTS = ("单号",)
 _SIGNATURE_COLS = ("是否更新应收款", "是否已登记系统", "收款形式")
 _NAME_HINTS = ("公司名称", "汇款人", "对方户名")
+_REMITTER_ALIASES = ("汇款人", "汇款人名称", "对方户名")
 # 盈亏表专有列：出现即判定"这不是流转表"
 _LEDGER_MARKERS = ("计提金额", "新智云单号", "回款明细", "是否结账")
 
@@ -118,6 +120,8 @@ class FlowLedger:
                     )
                     if idx is not None:
                         opt[k] = idx
+                company_idx = common.fuzzy_find_col(headers, ("公司名称", "客户名称"))
+                remitter_idx = common.fuzzy_find_col(headers, _REMITTER_ALIASES)
                 rno = hrow + 1
                 for row in it:
                     rno += 1
@@ -130,13 +134,18 @@ class FlowLedger:
                     amount = common.to_number(cell(cols["金额"]))
                     if date is None and amount is None:
                         continue
+                    company_name = str(cell(company_idx) or "").strip()
+                    remitter = str(cell(remitter_idx) or "").strip()
+                    payer = company_name or remitter or str(cell(cols["公司名称"]) or "").strip()
                     inst.rows.append(
                         {
                             "file": p.name,
                             "sheet": ws.title,
                             "row_no": rno,  # 1-based，含表头
                             "date": date,
-                            "payer": str(cell(cols["公司名称"]) or "").strip(),
+                            "company_name": company_name,
+                            "remitter": remitter,
+                            "payer": payer,
                             "amount": amount,
                             "order_cell": str(cell(cols["单号"]) or "").strip(),
                             "form": str(cell(opt.get("收款形式")) or "").strip()
@@ -170,6 +179,7 @@ class FlowLedger:
         amount_net: Optional[float],
         customer: str = "",
         fee: Optional[float] = 0.0,
+        sales_name: str = "",
     ) -> dict:
         """
         返回 {"hits": n, "rows": [...], "matched_by": str}
@@ -190,8 +200,25 @@ class FlowLedger:
             else []
         )
 
+        def names_match(row: dict) -> bool:
+            flow_names = {
+                str(row.get("company_name") or "").strip(),
+                str(row.get("remitter") or "").strip(),
+                str(row.get("payer") or "").strip(),
+            }
+            zhiyun_names = {
+                str(sales_name or "").strip(),
+                str(customer or "").strip(),
+            }
+            return any(
+                name_similar(flow_name, zhiyun_name)
+                for flow_name in flow_names
+                for zhiyun_name in zhiyun_names
+                if flow_name and zhiyun_name
+            )
+
         for pool, tag in ((cand_net, "三键"), (cand_gross, "三键(含手续费)")):
-            named = [r for r in pool if name_similar(r["payer"], customer)]
+            named = [r for r in pool if names_match(r)]
             if named:
                 return {"hits": len(named), "rows": named, "matched_by": tag}
 
@@ -367,14 +394,16 @@ def annotate_records(
             str(rec.get("shoukuan_date")),
             amount,
             rec.get("customer") or "",
+            rec.get("sales_name") or "",
             rec.get("fee") or 0.0,
         )
         if key not in cache:
             cache[key] = flow.match(
                 rec.get("shoukuan_date"),
                 amount,
-                rec.get("customer") or "",
-                rec.get("fee") or 0.0,
+                customer=rec.get("customer") or "",
+                fee=rec.get("fee") or 0.0,
+                sales_name=rec.get("sales_name") or "",
             )
         hit = cache[key]
         d = common.norm_date(rec.get("shoukuan_date"))
