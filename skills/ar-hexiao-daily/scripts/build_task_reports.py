@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把连续多日的日期级报表整理为三份任务范围版静态 Excel。"""
+"""把连续多日的日期级报表整理为三份任务范围版静态 Excel。
+
+多日任务的日期级 Excel 只是逐日校验和写入时的临时产物。三份范围版全部成功
+生成后，自动删除本次日期范围内的日期级同类报告，只保留范围版交付文件。
+"""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 from copy import copy
 from pathlib import Path
@@ -77,6 +82,18 @@ def _daily_counts(out_dir: Path, day: dt.date) -> dict:
     }
 
 
+def _daily_report_files(out_dir: Path, prefix: str, day: dt.date) -> list[Path]:
+    """返回某核销日的正式日报及多年度内部报告，不误匹配范围版文件。"""
+    token = day.strftime("%Y%m%d")
+    name_re = re.compile(
+        rf"^{re.escape(prefix)}_{token}(?:_\d{{4}})?\.xlsx$"
+    )
+    return sorted(
+        path for path in out_dir.glob(f"{prefix}_{token}*.xlsx")
+        if name_re.fullmatch(path.name)
+    )
+
+
 def build(workspace: Path, start: str, end: str) -> list[Path]:
     workspace = Path(workspace)
     if not (workspace / "04_产出").is_dir():
@@ -84,6 +101,7 @@ def build(workspace: Path, start: str, end: str) -> list[Path]:
     out_dir = workspace / "04_产出"
     days = list(_dates(start, end))
     outputs = []
+    daily_sources: set[Path] = set()
     for prefix, label in REPORTS:
         wb = openpyxl.Workbook()
         summary = wb.active
@@ -96,6 +114,7 @@ def build(workspace: Path, start: str, end: str) -> list[Path]:
         for day in days:
             token = day.strftime("%Y%m%d")
             daily = out_dir / f"{prefix}_{token}.xlsx"
+            daily_sources.update(_daily_report_files(out_dir, prefix, day))
             counts = _daily_counts(out_dir, day)
             summary.append([
                 day.isoformat(), "已纳入" if daily.is_file() else "当日无该报表",
@@ -108,7 +127,7 @@ def build(workspace: Path, start: str, end: str) -> list[Path]:
                 continue
             source_wb = openpyxl.load_workbook(daily, data_only=False, read_only=False)
             for index, source_ws in enumerate(source_wb.worksheets, 1):
-                title = f"{day.strftime('%m%d')}_{index}_{source_ws.title}"[:31]
+                title = f"{day.strftime('%Y%m%d')}_{index}_{source_ws.title}"[:31]
                 _copy_sheet(source_ws, wb.create_sheet(title))
             source_wb.close()
         summary.freeze_panes = "A2"
@@ -119,11 +138,21 @@ def build(workspace: Path, start: str, end: str) -> list[Path]:
         wb.save(target)
         workbook_finalize.finalize_static_report(target)
         outputs.append(target)
+
+    # 只有多日任务执行清理。必须等三份范围版全部保存并完成静态化后再删除日报，
+    # 这样任一步失败时仍保留逐日证据，可安全重试。
+    if len(days) > 1:
+        final_paths = {path.resolve() for path in outputs}
+        for source in sorted(daily_sources):
+            if source.resolve() not in final_paths and source.is_file():
+                source.unlink()
     return outputs
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="生成连续多日任务范围版三份报表")
+    parser = argparse.ArgumentParser(
+        description="生成连续多日任务范围版三份报表，并移除日期级同类报告"
+    )
     parser.add_argument("--workspace", default=str(common.WORK))
     parser.add_argument("--date-from", required=True)
     parser.add_argument("--date-to", required=True)
