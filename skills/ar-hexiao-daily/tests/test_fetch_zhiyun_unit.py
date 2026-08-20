@@ -309,3 +309,174 @@ def test_supplement_identifiers_are_searched_exactly_and_reported_against_export
     assert result["existing"]["so_ids"] == ["SO26020320"]
     assert result["unresolved"]["ar_ids"] == ["AR26079999"]
     assert result["unresolved"]["so_ids"] == ["SO26029999"]
+
+
+def test_resolve_fetch_dates_keeps_workdays_in_chronological_order():
+    assert F.resolve_fetch_dates(
+        single_date="",
+        date_from="2026-08-14",
+        date_to="2026-08-18",
+        include_weekends=False,
+    ) == ["2026-08-14", "2026-08-17", "2026-08-18"]
+
+
+def test_date_range_fetch_logs_in_once_and_writes_each_day_separately(
+    tmp_path, monkeypatch
+):
+    login_calls = []
+    client_calls = []
+    filtered_days = []
+
+    def fake_login(base_url, user, password, *, headless):
+        login_calls.append((base_url, user, password, headless))
+        return "session-cookie", "account-id"
+
+    class FakeClient:
+        def __init__(self, base_url, cookie, *, account_id=""):
+            client_calls.append((base_url, cookie, account_id))
+
+        @staticmethod
+        def controls(_worksheet_id):
+            return [
+                {
+                    "controlId": "xiadan",
+                    "controlName": F.REL_XIADAN,
+                    "dataSource": "orders",
+                }
+            ]
+
+        @staticmethod
+        def option_maps(_controls):
+            return {}
+
+        @staticmethod
+        def id_by_name(controls, name):
+            for control in controls:
+                if control.get("controlName") == name:
+                    return control.get("controlId", "")
+            return ""
+
+        @staticmethod
+        def datasource_of(_worksheet_id, relation):
+            return "orders" if relation == F.REL_XIADAN else ""
+
+        @staticmethod
+        def filter_rows_by_date(_worksheet_id, _control_id, day):
+            filtered_days.append(day)
+            return [], 0
+
+    monkeypatch.delenv("MD_PSS_ID", raising=False)
+    monkeypatch.setattr(F, "resolve_credentials", lambda _args: ("user", "secret"))
+    monkeypatch.setattr(F, "login_with_password", fake_login)
+    monkeypatch.setattr(F, "ZhiyunClient", FakeClient)
+
+    assert F.main([
+        "--date-from", "2026-08-14",
+        "--date-to", "2026-08-17",
+        "--workspace", str(tmp_path),
+        "--skip-gap-check",
+    ]) == 0
+
+    assert len(login_calls) == 1
+    assert len(client_calls) == 1
+    assert filtered_days == ["2026-08-14", "2026-08-17"]
+    export_dir = tmp_path / "01_智云导出"
+    for tag in ("20260814", "20260817"):
+        assert (export_dir / f"回款记录_{tag}.xlsx").is_file()
+        assert (export_dir / f"订单交付_{tag}.xlsx").is_file()
+        assert (export_dir / f"核销明细_{tag}.xlsx").is_file()
+        assert (export_dir / f"订单明细_{tag}.xlsx").is_file()
+        assert (export_dir / f"取数摘要_{tag}.json").is_file()
+
+
+def test_date_range_uses_current_daily_exports_without_logging_in(
+    tmp_path, monkeypatch
+):
+    export_dir = tmp_path / "01_智云导出"
+    export_dir.mkdir()
+    for day in ("2026-08-14", "2026-08-17"):
+        stamp = day.replace("-", "")
+        for role in ("回款记录", "订单交付", "核销明细", "订单明细"):
+            (export_dir / f"{role}_{stamp}.xlsx").write_bytes(b"fixture")
+        (export_dir / f"取数摘要_{stamp}.json").write_text(
+            '{"export_schema_version":"' + F.EXPORT_SCHEMA_VERSION + '"}',
+            encoding="utf-8",
+        )
+
+    def unexpected_login(*_args, **_kwargs):
+        raise AssertionError("全部日期命中缓存时不应登录智云")
+
+    monkeypatch.delenv("MD_PSS_ID", raising=False)
+    monkeypatch.setattr(F, "resolve_credentials", unexpected_login)
+
+    assert F.main([
+        "--date-from", "2026-08-14",
+        "--date-to", "2026-08-17",
+        "--workspace", str(tmp_path),
+        "--skip-gap-check",
+    ]) == 0
+
+
+def test_date_range_stops_after_a_daily_fetch_failure(tmp_path, monkeypatch):
+    filtered_days = []
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def controls(_worksheet_id):
+            return [{
+                "controlId": "xiadan",
+                "controlName": F.REL_XIADAN,
+                "dataSource": "orders",
+            }]
+
+        @staticmethod
+        def option_maps(_controls):
+            return {}
+
+        @staticmethod
+        def id_by_name(controls, name):
+            for control in controls:
+                if control.get("controlName") == name:
+                    return control.get("controlId", "")
+            return ""
+
+        @staticmethod
+        def datasource_of(_worksheet_id, relation):
+            return "orders" if relation == F.REL_XIADAN else ""
+
+        @staticmethod
+        def filter_rows_by_date(_worksheet_id, _control_id, day):
+            filtered_days.append(day)
+            if day == "2026-08-17":
+                raise RuntimeError("simulated daily fetch failure")
+            return [], 0
+
+    monkeypatch.setenv("MD_PSS_ID", "session-cookie")
+    monkeypatch.setattr(F, "ZhiyunClient", FakeClient)
+
+    assert F.main([
+        "--date-from", "2026-08-14",
+        "--date-to", "2026-08-18",
+        "--workspace", str(tmp_path),
+        "--skip-gap-check",
+    ]) == 2
+    assert filtered_days == ["2026-08-14", "2026-08-17"]
+    assert not (
+        tmp_path / "01_智云导出" / "取数摘要_20260818.json"
+    ).exists()
+
+
+def test_date_range_rejects_identifier_supplement(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        F.main([
+            "--date-from", "2026-08-14",
+            "--date-to", "2026-08-17",
+            "--supplement-ar", "AR26080001",
+            "--workspace", str(tmp_path),
+            "--skip-gap-check",
+        ])
