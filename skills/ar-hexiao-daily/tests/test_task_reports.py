@@ -10,6 +10,18 @@ import build_task_reports as B
 import workbook_finalize as W
 
 
+def _find_lightweight_checker():
+    for parent in Path(__file__).resolve().parents:
+        for relative in (
+            ("tools", "xlsx_lightweight_audit.py"),
+            ("03_tools", "scripts", "xlsx_lightweight_audit.py"),
+        ):
+            candidate = parent.joinpath(*relative)
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _report(path, title, value):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -52,8 +64,8 @@ def test_build_task_reports_keeps_only_three_static_range_files(tmp_path):
         assert audit.formula_cells == 0
         assert audit.full_calc_on_load == "0"
         assert audit.force_full_calc == "0"
-        checker = Path(r"D:\BESTEASY\03_tools\scripts\xlsx_lightweight_audit.py")
-        if checker.is_file():
+        checker = _find_lightweight_checker()
+        if checker is not None:
             checked = subprocess.run(
                 [sys.executable, str(checker), str(path), "--strict"],
                 capture_output=True, text=True, encoding="utf-8",

@@ -11,7 +11,7 @@
   漏一天 = 那天的到账永远不会回填进盈亏表，而且**没有任何地方看得出来**。
 
 所以：每跑一个核销日就在这里登记；每次开跑前先查空档，
-**有空档先报给她**（「7-22、7-23 没跑过，要不要先补」），而不是闷头跑昨天。
+**有空档就交给编排器从最早日期自动补跑**，而不是只闷头跑昨天。
 
 一天一个核销日，**不合并**：合并会让 AR 覆盖率校验、幂等校验和她对着清单
 逐行核对全部失真（她核的是"这一天的到账"）。
@@ -21,7 +21,7 @@
     python3 scripts/batch_ledger.py record --workspace 工作区 --hexiao-date 2026-07-24 \
             --stage classified --payments 4
     python3 scripts/batch_ledger.py show   --workspace 工作区 [--limit 15]
-退出码：gaps 有空档=1（好让编排脚本停下来问她），无空档=0；其余 0/2。
+退出码：gaps 有空档=1（供编排器读取补跑范围，不代表需要人工确认），无空档=0；其余 0/2。
 """
 from __future__ import annotations
 
@@ -176,7 +176,7 @@ def find_gaps(
 def suggest_date(workspace: Path, today: Optional[dt.date] = None) -> Dict[str, object]:
     """
     建议这次该跑哪个核销日 = **最早那个没跑过的**（有空档就先补最早的），
-    否则 = 上一个工作日。附上理由，供 SKILL 复述给她确认。
+    否则 = 上一个工作日。附上理由，供编排器直接执行。
     """
     today = today or dt.date.today()
     default = common.prev_workday(today)
@@ -220,11 +220,11 @@ def _cmd_gaps(args) -> int:
     if info["skipped_weekend"] and not args.all_days:
         print(f"（另有 {len(info['skipped_weekend'])} 个周末未计入；要连周末一起补加 --all-days）")
     print("→ 一天一批，从最早的那天开始补；别把几天合成一批跑。")
-    # 给 agent 一句可直接说给她听的短话（她要的是短，不是解释）
+    # 给编排器一段短提示：读取补跑范围后直接继续，不把流程变成人工确认闸。
     short = "、".join(f"{d.month}-{d.day}" for d in gaps[:6]) + ("…" if len(gaps) > 6 else "")
     print(
-        f'\n【照说这句】有 {len(gaps)} 天没跑：{short}。'
-        f"我从早到晚一天一天来，每天出一份清单你点头我再写。开始？"
+        f'\n【自动处理计划】有 {len(gaps)} 天待处理：{short}。'
+        "编排器将从最早日期开始逐日取数、判定、校验并写入；不合并日期，也不等待人工确认。"
     )
     return 1
 

@@ -355,6 +355,18 @@ def test_suggest_walks_forward_day_by_day(tmp_path):
     assert BL.suggest_date(tmp_path, today=dt.date(2026, 7, 24))["date"] == dt.date(2026, 7, 22)
 
 
+def test_gaps_prints_automatic_plan_without_confirmation_prompt(tmp_path, capsys):
+    (tmp_path / "02_我的表副本").mkdir()
+    (tmp_path / "02_我的表副本" / "盈亏.xlsx").write_bytes(b"test")
+    BL.record(tmp_path, dt.date(2026, 7, 20), "applied", payments=1)
+    rc = BL.main(["gaps", "--workspace", str(tmp_path), "--through", "2026-07-24"])
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "自动处理计划" in output
+    assert "点头" not in output
+    assert "开始？" not in output
+
+
 # ══════════════════════════════════════════════════════════
 # D. 工作区解析（2026-07-25 opencode 实测踩到：产出分家 → 流转静默不写）
 # ══════════════════════════════════════════════════════════

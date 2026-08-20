@@ -47,6 +47,11 @@ def _copy_sheet(source, target) -> None:
         for cell in row:
             out = target[cell.coordinate]
             out.value = cell.value
+            # 范围版和多年度合并版都是静态审计报表。源报表中的「公式原文」
+            # 以 = 开头，但它只是供人核对的说明文字；openpyxl 赋值到新
+            # 单元格时会把它重新识别成可执行公式，导致静态报表校验失败。
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                out.data_type = "s"
             if cell.has_style:
                 out._style = copy(cell._style)
             if cell.number_format:

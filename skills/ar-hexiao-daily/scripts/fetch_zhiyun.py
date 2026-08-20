@@ -24,15 +24,16 @@
   3. 它是独立筛的第二张表，与回款记录可能不同步；关联读法天然同步。
 
 红线：只读（GetFilterRows / getRowRelationRows / getWorksheetInfo，无任何写接口）；
-      账号密码每次运行时提供，绝不写进代码 / config / git。
+  账号密码只从本机 Windows 凭据库或环境变量读取，绝不写进代码 / config / git；
+  自动任务不会在取数过程中弹出账号密码询问。
 
 用法：
   export ZHIYUN_USER='你的智云账号'
   export ZHIYUN_PASS   # 在 shell 里 export，勿写进任何文件；用完 unset
   python3 scripts/fetch_zhiyun.py --date 2026-07-22 --workspace 工作区/
 
-  或交互（推荐，密码不回显、不落盘）：
-  python3 scripts/fetch_zhiyun.py --date yesterday --workspace 工作区/
+  或预先配置 MD_PSS_ID 后运行：
+    python3 scripts/fetch_zhiyun.py --date yesterday --workspace 工作区/
 
 依赖：playwright（登录）+ requests（取数）+ openpyxl（写出 xlsx）
   pip install playwright requests openpyxl && playwright install chromium
@@ -40,9 +41,9 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ── 常量（表 ID / 字段 ID 来自 2026-07-09/22/23 勘探，非密钥）────────────────
 BASE_DEFAULT = "http://192.168.10.167:18880"
+
+
+def _assert_platform_network_url(url: str) -> None:
+    if os.environ.get("FINANCIAL_NETWORK_POLICY_REQUIRED") != "1":
+        return
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").encode("idna").decode("ascii").lower()
+    allowed = {
+        item.strip().lower()
+        for item in os.environ.get("FINANCIAL_NETWORK_ALLOWLIST", "").split(",")
+        if item.strip()
+    }
+    if os.environ.get("FINANCIAL_NETWORK_ACCESS") != "1" or host not in allowed:
+        raise RuntimeError("网络目标不在平台批准的精确域名白名单中。")
 APP_ID = "6ff4fb2e-e68c-4ee9-83a0-836de8f72c11"
 EXPORT_SCHEMA_VERSION = "2026-08-13-flow-sales-name-v4"
 CREDENTIAL_SERVICE = "codex.ar-hexiao-daily.zhiyun"
@@ -173,7 +189,7 @@ def resolve_date(s: str) -> str:
     明妹口径：两者没有固定隔天关系，天然可能差好几天。
 
     另外：`yesterday` 是相对**运行那一刻**算的，她晚上跑和第二天早上跑不是同一天。
-    所以调用方（SKILL / main）必须把解析结果**复述给她确认**，别让相对说法飘着。
+    主流程在接到核销指令后立即把它解析成绝对日期，并在本批内部固定使用，不再二次询问。
     """
     s = (s or "").strip().lower()
     if s in ("yesterday", "t-1", "昨天"):
@@ -268,7 +284,14 @@ class ZhiyunClient:
 
     def post(self, path: str, body: dict, timeout: int = 90) -> dict:
         url = f"{self.base}/wwwapi/{path.lstrip('/')}"
-        r = self.session.post(url, headers=self.headers, json=body, timeout=timeout)
+        _assert_platform_network_url(url)
+        r = self.session.post(
+            url,
+            headers=self.headers,
+            json=body,
+            timeout=timeout,
+            allow_redirects=False,
+        )
         r.raise_for_status()
         j = r.json()
         if isinstance(j, dict) and "data" in j:
@@ -533,6 +556,120 @@ def write_xlsx(path: Path, headers: List[str], rows: List[List[Any]]) -> None:
     wb.save(str(path))
 
 
+def _row_contains_identifier(row: dict, identifier: str, extractor) -> bool:
+    return any(extractor(_plain(value)) == identifier for value in row.values())
+
+
+def search_supplement_identifiers(
+    client: ZhiyunClient,
+    ar_ids: Sequence[str],
+    so_ids: Sequence[str],
+) -> dict[str, dict[str, List[str]]]:
+    """按工作人员提供的编号精确搜索智云，只返回编号存在性。"""
+    found_ar_ids: List[str] = []
+    for ar_id in sorted(set(ar_ids)):
+        try:
+            hits = client.search_rows(WS_HUIKUAN, ar_id)
+        except Exception:
+            hits = []
+        if any(_plain(row.get(F_HK["ar"])) == ar_id for row in hits):
+            found_ar_ids.append(ar_id)
+
+    worksheet_ids = []
+    for relation in (REL_XIADAN, REL_HEXIAO_MINGXI, REL_SODLINE):
+        try:
+            worksheet_id = client.datasource_of(WS_HUIKUAN, relation)
+        except Exception:
+            worksheet_id = ""
+        if worksheet_id and worksheet_id not in worksheet_ids:
+            worksheet_ids.append(worksheet_id)
+    found_so_ids: List[str] = []
+    for so_id in sorted(set(so_ids)):
+        found = False
+        for worksheet_id in worksheet_ids:
+            try:
+                hits = client.search_rows(worksheet_id, so_id)
+            except Exception:
+                continue
+            if any(_row_contains_identifier(row, so_id, extract_so) for row in hits):
+                found = True
+                break
+        if found:
+            found_so_ids.append(so_id)
+    return {"found_ar_ids": found_ar_ids, "found_so_ids": found_so_ids}
+
+
+def exported_supplement_identifiers(out_dir: Path, day: str) -> dict[str, set[str]]:
+    """读取四张导出表中的 AR/SO 编号，用于判断补取前后变化。"""
+    from openpyxl import load_workbook
+
+    tag = day.replace("-", "")
+    ar_ids: set[str] = set()
+    so_ids: set[str] = set()
+
+    def collect(prefix: str, ar_columns: Sequence[int], so_columns: Sequence[int]) -> None:
+        matches = sorted(out_dir.glob(f"{prefix}_{tag}*.xlsx"), key=lambda item: item.name)
+        if not matches:
+            return
+        workbook = load_workbook(matches[-1], read_only=True, data_only=True)
+        try:
+            worksheet = workbook.active
+            for row in worksheet.iter_rows(min_row=2, values_only=True):
+                for column in ar_columns:
+                    if column < len(row):
+                        value = extract_ar(_plain(row[column]))
+                        if value:
+                            ar_ids.add(value)
+                for column in so_columns:
+                    if column < len(row):
+                        value = extract_so(_plain(row[column]))
+                        if value:
+                            so_ids.add(value)
+        finally:
+            workbook.close()
+
+    collect("回款记录", (0,), ())
+    collect("订单交付", (0,), (1,))
+    collect("核销明细", (2,), (8,))
+    collect("订单明细", (), (0,))
+    return {"ar_ids": ar_ids, "so_ids": so_ids}
+
+
+def build_supplement_result(
+    ar_ids: Sequence[str],
+    so_ids: Sequence[str],
+    *,
+    before: dict[str, set[str]],
+    after: dict[str, set[str]],
+    searched: dict[str, List[str]],
+) -> dict[str, List[str]]:
+    requested_ar = set(ar_ids)
+    requested_so = set(so_ids)
+    before_ar = set(before.get("ar_ids", set()))
+    before_so = set(before.get("so_ids", set()))
+    after_ar = set(after.get("ar_ids", set()))
+    after_so = set(after.get("so_ids", set()))
+    return {
+        "requested": {"ar_ids": sorted(requested_ar), "so_ids": sorted(requested_so)},
+        "found": {
+            "ar_ids": sorted(set(searched.get("found_ar_ids", []))),
+            "so_ids": sorted(set(searched.get("found_so_ids", []))),
+        },
+        "added": {
+            "ar_ids": sorted(requested_ar & (after_ar - before_ar)),
+            "so_ids": sorted(requested_so & (after_so - before_so)),
+        },
+        "existing": {
+            "ar_ids": sorted(requested_ar & before_ar & after_ar),
+            "so_ids": sorted(requested_so & before_so & after_so),
+        },
+        "unresolved": {
+            "ar_ids": sorted(requested_ar - after_ar),
+            "so_ids": sorted(requested_so - after_so),
+        },
+    }
+
+
 def historical_writeoffs_for_sos(
     client: ZhiyunClient,
     worksheet_id: str,
@@ -593,7 +730,13 @@ def historical_writeoffs_for_sos(
     return out
 
 
-def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
+def fetch_day(
+    client: ZhiyunClient,
+    day: str,
+    out_dir: Path,
+    supplement_ar_ids: Sequence[str] = (),
+    supplement_so_ids: Sequence[str] = (),
+) -> dict:
     """拉一天的四张表 + 摘要 json。返回计数摘要（无客户名/金额明细）。"""
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -610,6 +753,19 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
         raise FetchError(f"回款记录里找不到「{REL_XIADAN}」关联字段——智云表结构变了，停下别猜")
 
     hk_rows, hk_total = client.filter_rows_by_date(WS_HUIKUAN, F_HK["hexiao_date"], day)
+    known_payment_rows = {str(row.get("rowid") or "") for row in hk_rows}
+    for ar_id in supplement_ar_ids:
+        exact = [
+            row
+            for row in client.search_rows(WS_HUIKUAN, ar_id)
+            if _plain(row.get(F_HK["ar"])) == ar_id
+            and _plain(row.get(F_HK["hexiao_date"]))[:10] == day
+        ]
+        for row in exact:
+            row_id = str(row.get("rowid") or "")
+            if row_id and row_id not in known_payment_rows:
+                hk_rows.append(row)
+                known_payment_rows.add(row_id)
 
     # ── ① 回款记录 ────────────────────────────────────────────
     hk_headers = [
@@ -648,7 +804,7 @@ def fetch_day(client: ZhiyunClient, day: str, out_dir: Path) -> dict:
     xd_out: List[List[Any]] = []
     mx_out: List[List[Any]] = []
     mx_seen_record_ids = set()
-    all_so: List[str] = []
+    all_so: List[str] = list(dict.fromkeys(supplement_so_ids))
     ars_without_orders: List[str] = []
     settlement_recovered_ars: List[str] = []
     settlement_rows_used = 0
@@ -915,18 +1071,14 @@ def resolve_credentials(args) -> Tuple[str, str]:
         user = saved_user
     if not pwd and user == saved_user:
         pwd = saved_pwd
-    try:
-        if not user:
-            user = input("智云账号（邮箱/手机）: ").strip()
-        if not pwd:
-            pwd = getpass.getpass("智云密码（不回显）: ")
-    except (EOFError, KeyboardInterrupt):
-        raise SystemExit(
-            "ERROR: 没有可用的智云登录凭据。请先把测试账号保存到 Windows 凭据库，"
-            "或在交互终端输入一次。"
-        )
+    # 核销指令后的主流程必须无人值守；不在中途弹出账号/密码问题，
+    # 也不把凭据写进命令行或文件。认证只能来自 MD_PSS_ID、环境变量或
+    # 本机 Windows 凭据库；缺失时明确停止，由编排层一次性报告阻塞原因。
     if not user or not pwd:
-        raise SystemExit("ERROR: 需要账号和密码（或改用 --cookie-only + MD_PSS_ID）")
+        raise SystemExit(
+            "ERROR: 没有可用的智云登录凭据。自动任务不会在取数中途询问账号密码；"
+            "请先配置本机 Windows 凭据库/环境变量，或提供 MD_PSS_ID 后重新执行。"
+        )
     return user, pwd
 
 
@@ -946,6 +1098,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--force", action="store_true",
         help="这天的四件套已在 01_智云导出/ 里也强制重新取一遍",
     )
+    ap.add_argument("--supplement-ar", action="append", default=[], help="按完整 AR 编号补取并复核")
+    ap.add_argument("--supplement-so", action="append", default=[], help="按完整 SO 编号补取并复核")
     ap.add_argument(
         "--accept-unversioned-existing",
         action="store_true",
@@ -957,12 +1111,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--user", default="", help="账号；也可用环境变量 ZHIYUN_USER")
     ap.add_argument(
         "--password", default="",
-        help="密码（不推荐写在命令行历史）；优先用 ZHIYUN_PASS 或交互 getpass",
+        help="密码（不推荐写在命令行历史）；优先用 ZHIYUN_PASS 或本机凭据库，任务中不交互询问",
     )
     ap.add_argument("--cookie-only", action="store_true", help="不登录，只用 MD_PSS_ID")
     ap.add_argument("--account-id", default=os.environ.get("ZHIYUN_ACCOUNT_ID", ""))
     ap.add_argument("--headed", action="store_true", help="有头浏览器登录（调试）")
     args = ap.parse_args(argv)
+
+    ar_ids = list(dict.fromkeys(str(value).strip().upper() for value in args.supplement_ar if str(value).strip()))
+    so_ids = list(dict.fromkeys(str(value).strip().upper() for value in args.supplement_so if str(value).strip()))
+    if any(not re.fullmatch(r"AR[A-Z0-9_-]{3,30}", value) for value in ar_ids):
+        ap.error("补取 AR 编号格式无效")
+    if any(not re.fullmatch(r"SO[A-Z0-9_-]{3,30}", value) for value in so_ids):
+        ap.error("补取 SO 编号格式无效")
+    supplement_mode = bool(ar_ids or so_ids)
 
     day = resolve_date(args.date)
     if args.out:
@@ -972,7 +1134,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         out_dir = Path(__file__).resolve().parent.parent / "工作区" / "01_智云导出"
 
-    # ① 把"跑哪天"说死了再登录取数（相对说法解析成具体日期，供 agent 复述给她确认）
+    # ① 把"跑哪天"固定下来；相对说法只在任务入口解析一次，不再中途询问。
     print(f"★ 本次取的是**核销日期 = {day}** 的到账（销售在这一天核销的；不是到账日期）")
 
     # ② 漏天检查：`--date yesterday` 只看昨天，她请假/周末/系统故障跳过的那几天
@@ -1016,7 +1178,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"⚠ {day} 已有四件套，但没有当前取数版本 "
             f"{EXPORT_SCHEMA_VERSION}；本次禁止复用，立即重新抓取。"
         )
-    if len(have) == 4 and not args.force:
+    if len(have) == 4 and not args.force and not supplement_mode:
         print(
             f"✅ {day} 的智云四件套已经在 {out_dir} 里了，**不用再取数**：\n   "
             + "\n   ".join(have)
@@ -1042,6 +1204,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         del pwd
         print("登录成功，开始只读取数…")
 
+    before_identifiers = exported_supplement_identifiers(out_dir, day) if supplement_mode else {}
     try:
         client = ZhiyunClient(args.base_url, cookie, account_id=account_id)
         try:
@@ -1049,13 +1212,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             print(f"ERROR: 取字段失败（内网不通/无权限？）: {e}", file=sys.stderr)
             return 2
-        summary = fetch_day(client, day, out_dir)
+        searched = search_supplement_identifiers(client, ar_ids, so_ids) if supplement_mode else {}
+        summary = fetch_day(client, day, out_dir, ar_ids, so_ids)
     finally:
         cookie = ""
         del cookie
 
     print("✅ 智云只读取数完成（未写系统）")
     print(f"📁 核销日期: {day}   目录: {out_dir.resolve()}")
+    if supplement_mode:
+        after_identifiers = exported_supplement_identifiers(out_dir, day)
+        supplement_result = build_supplement_result(
+            ar_ids,
+            so_ids,
+            before=before_identifiers,
+            after=after_identifiers,
+            searched=searched,
+        )
+        result_path = out_dir / f"补取结果_{day.replace('-', '')}.json"
+        result_path.write_text(
+            json.dumps(supplement_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            "补取复核完成：新增 "
+            f"{len(supplement_result['added']['ar_ids']) + len(supplement_result['added']['so_ids'])} 个，"
+            "仍未找到 "
+            f"{len(supplement_result['unresolved']['ar_ids']) + len(supplement_result['unresolved']['so_ids'])} 个。"
+        )
 
     # 空批要说明白：「那天销售一笔都没核销」和「取数取失败了」看着都是 0 笔，
     # 但一个是收工、一个是事故。不区分她会以为跑过了就不管了。

@@ -138,7 +138,15 @@ def test_plan_strong_write_weak_hand():
     assert plan["counts"]["hand"] >= 3
 
 
-@pytest.mark.parametrize("matched_by", ["三键(原币公式)", "三键(原币公式含手续费)"])
+@pytest.mark.parametrize(
+    "matched_by",
+    [
+        "三键(原币公式)",
+        "三键(原币公式含手续费)",
+        "三键(原币公式,中英文对照)",
+        "三键(原币公式含手续费,中英文对照)",
+    ],
+)
 def test_plan_accepts_unique_foreign_formula_match_as_strong(matched_by):
     result = _result_with_flow_items([{
         "ar": "AR_FX",

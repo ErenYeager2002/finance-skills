@@ -126,7 +126,9 @@ def test_no_credentials_in_source():
     # 禁止真实账号/密码痕迹（允许文档里出现变量名 ZHIYUN_PASS）
     assert "sharon" not in text.lower()
     assert "sharon1234" not in text
-    assert "getpass" in text  # 必须支持交互输入
+    assert "getpass" not in text  # 核销任务不在取数中途交互询问
+    assert "input(" not in text
+    assert "自动任务不会在取数过程中弹出账号密码询问" in text
     # 禁止把真实密码字面量赋给环境示例
     assert "PASS='****'" not in text
 
@@ -252,3 +254,58 @@ def test_historical_writeoffs_only_dedup_same_record_id_and_never_business_field
         FakeClient(), "WS_MX", ["SO26000001"], "2026-07-31"
     )
     assert [item[0] for item in got] == ["HX1", "HX2", "", ""]
+
+
+def test_supplement_identifiers_are_searched_exactly_and_reported_against_exports():
+    class FakeClient:
+        @staticmethod
+        def controls(_worksheet_id):
+            return [
+                {"controlId": "order", "controlName": "SO"},
+                {"controlId": "ar", "controlName": "回款记录NUM"},
+            ]
+
+        @staticmethod
+        def id_by_name(_controls, _name):
+            return "relation"
+
+        @staticmethod
+        def datasource_of(_worksheet_id, relation):
+            return {
+                F.REL_XIADAN: "orders",
+                F.REL_HEXIAO_MINGXI: "writeoffs",
+                F.REL_SODLINE: "details",
+            }.get(relation, "")
+
+        @staticmethod
+        def search_rows(worksheet_id, identifier):
+            if worksheet_id == F.WS_HUIKUAN and identifier == "AR26070140":
+                return [
+                    {F.F_HK["ar"]: "AR26070140"},
+                    {F.F_HK["ar"]: "AR260701400"},
+                ]
+            if worksheet_id == "orders" and identifier == "SO26020320":
+                return [{"order": '[{"name":"SO26020320"}]'}]
+            return []
+
+    searched = F.search_supplement_identifiers(
+        FakeClient(),
+        ["AR26070140", "AR26079999"],
+        ["SO26020320", "SO26029999"],
+    )
+    assert searched == {
+        "found_ar_ids": ["AR26070140"],
+        "found_so_ids": ["SO26020320"],
+    }
+
+    result = F.build_supplement_result(
+        ["AR26070140", "AR26079999"],
+        ["SO26020320", "SO26029999"],
+        before={"ar_ids": set(), "so_ids": {"SO26020320"}},
+        after={"ar_ids": {"AR26070140"}, "so_ids": {"SO26020320"}},
+        searched=searched,
+    )
+    assert result["added"]["ar_ids"] == ["AR26070140"]
+    assert result["existing"]["so_ids"] == ["SO26020320"]
+    assert result["unresolved"]["ar_ids"] == ["AR26079999"]
+    assert result["unresolved"]["so_ids"] == ["SO26029999"]
