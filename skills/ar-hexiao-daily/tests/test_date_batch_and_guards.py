@@ -249,7 +249,7 @@ def test_resolve_batch_date_is_absolute():
 
 
 def test_prev_workday_skips_weekend():
-    """周一跑时"昨天"是周日，销售周末不核销 → 默认值该给上周五。"""
+    """明确要求上个工作日时仍跳过周末。"""
     assert C.prev_workday(dt.date(2026, 7, 27)) == dt.date(2026, 7, 24)  # 周一 → 上周五
     assert C.prev_workday(dt.date(2026, 7, 24)) == dt.date(2026, 7, 23)
 
@@ -271,14 +271,12 @@ def test_batch_ledger_records_and_finds_gaps(tmp_path):
     assert gaps == ["2026-07-21", "2026-07-22", "2026-07-24"]
 
 
-def test_batch_ledger_skips_weekend_by_default(tmp_path):
+def test_batch_ledger_includes_weekend_by_default(tmp_path):
     BL.record(tmp_path, dt.date(2026, 7, 23), "applied", payments=1)
     info = BL.find_gaps(tmp_path, through=dt.date(2026, 7, 27))
     gaps = [d.isoformat() for d in info["gaps"]]
-    assert "2026-07-25" not in gaps  # 周六
-    assert "2026-07-26" not in gaps  # 周日
-    assert "2026-07-24" in gaps and "2026-07-27" in gaps
-    assert len(info["skipped_weekend"]) == 2
+    assert gaps == ["2026-07-24", "2026-07-25", "2026-07-26", "2026-07-27"]
+    assert info["skipped_weekend"] == []
 
 
 def test_empty_batch_counts_as_done(tmp_path):
@@ -440,10 +438,19 @@ def test_already_fetched_detects_full_set(tmp_path):
     import fetch_zhiyun as FZ
     d = tmp_path / "01_智云导出"
     d.mkdir(parents=True)
+    hashes = {}
     for k in ("回款记录", "订单交付", "核销明细", "订单明细"):
-        (d / f"{k}_20260722.xlsx").write_bytes(b"x")
+        path = d / f"{k}_20260722.xlsx"
+        path.write_bytes(b"x")
+        hashes[path.name] = FZ._sha256(path)
     (d / "取数摘要_20260722.json").write_text(
-        '{"export_schema_version":"' + FZ.EXPORT_SCHEMA_VERSION + '"}',
+        json.dumps(
+            {
+                "export_schema_version": FZ.EXPORT_SCHEMA_VERSION,
+                "file_sha256": hashes,
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     assert len(FZ.already_fetched(d, "2026-07-22")) == 4

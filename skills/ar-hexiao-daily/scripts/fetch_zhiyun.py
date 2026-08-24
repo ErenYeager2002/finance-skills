@@ -41,10 +41,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -67,8 +71,10 @@ def _assert_platform_network_url(url: str) -> None:
     if os.environ.get("FINANCIAL_NETWORK_ACCESS") != "1" or host not in allowed:
         raise RuntimeError("网络目标不在平台批准的精确域名白名单中。")
 APP_ID = "6ff4fb2e-e68c-4ee9-83a0-836de8f72c11"
-EXPORT_SCHEMA_VERSION = "2026-08-13-flow-sales-name-v4"
+EXPORT_SCHEMA_VERSION = "2026-08-21-atomic-fetch-v5"
 CREDENTIAL_SERVICE = "codex.ar-hexiao-daily.zhiyun"
+READ_REQUEST_MAX_ATTEMPTS = 3
+MAX_BATCH_FETCH_CONCURRENCY = 8
 
 WS_HUIKUAN = "6555d2b1f9460e517040ba6c"  # 回款记录（唯一入口）
 
@@ -313,17 +319,55 @@ class ZhiyunClient:
             self.headers["AccountId"] = account_id
         self._tpl_cache: Dict[str, List[dict]] = {}
 
+    def close(self) -> None:
+        self.session.close()
+
     def post(self, path: str, body: dict, timeout: int = 90) -> dict:
+        import requests
+
         url = f"{self.base}/wwwapi/{path.lstrip('/')}"
         _assert_platform_network_url(url)
-        r = self.session.post(
-            url,
-            headers=self.headers,
-            json=body,
-            timeout=timeout,
-            allow_redirects=False,
-        )
-        r.raise_for_status()
+        r = None
+        for attempt in range(1, READ_REQUEST_MAX_ATTEMPTS + 1):
+            try:
+                r = self.session.post(
+                    url,
+                    headers=self.headers,
+                    json=body,
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt >= READ_REQUEST_MAX_ATTEMPTS:
+                    raise
+                delay = float(2 ** (attempt - 1))
+                print(
+                    "WARN: 智云只读请求暂时不可用"
+                    f"（{type(exc).__name__}），{delay:g} 秒后重试"
+                    f"（{attempt + 1}/{READ_REQUEST_MAX_ATTEMPTS}）",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            if (
+                (r.status_code in {408, 429} or 500 <= r.status_code < 600)
+                and attempt < READ_REQUEST_MAX_ATTEMPTS
+            ):
+                delay = float(2 ** (attempt - 1))
+                retry_after = str(r.headers.get("Retry-After") or "").strip()
+                if retry_after.isdigit():
+                    delay = min(10.0, max(delay, float(retry_after)))
+                print(
+                    f"WARN: 智云只读请求暂时返回 HTTP {r.status_code}，"
+                    f"{delay:g} 秒后重试（{attempt + 1}/{READ_REQUEST_MAX_ATTEMPTS}）",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            r.raise_for_status()
+            break
+        if r is None:  # pragma: no cover - 循环至少执行一次
+            raise RuntimeError("智云只读请求未执行。")
         j = r.json()
         if isinstance(j, dict) and "data" in j:
             return j["data"] if j["data"] is not None else {}
@@ -585,6 +629,50 @@ def write_xlsx(path: Path, headers: List[str], rows: List[List[Any]]) -> None:
     for r in rows:
         ws.append(r)
     wb.save(str(path))
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def publish_day_exports(
+    out_dir: Path,
+    day_tag: str,
+    datasets: Sequence[Tuple[str, List[str], List[List[Any]]]],
+    summary: dict,
+) -> dict:
+    """Build a complete daily bundle off to the side and publish its marker last."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".fetch-{day_tag}-", dir=out_dir) as raw_staging:
+        staging = Path(raw_staging)
+        published_names: List[str] = []
+        for name, headers, rows in datasets:
+            staged_path = staging / name
+            write_xlsx(staged_path, headers, rows)
+            published_names.append(name)
+        completed_summary = {
+            **summary,
+            "files": published_names,
+            "file_sha256": {
+                name: _sha256(staging / name)
+                for name in published_names
+            },
+        }
+        summary_name = f"取数摘要_{day_tag}.json"
+        staged_summary = staging / summary_name
+        staged_summary.write_text(
+            json.dumps(completed_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for name in published_names:
+            os.replace(staging / name, out_dir / name)
+        # 摘要是完成标记，必须最后发布；中断后的新旧混合文件无法通过哈希校验。
+        os.replace(staged_summary, out_dir / summary_name)
+    return completed_summary
 
 
 def _row_contains_identifier(row: dict, identifier: str, extractor) -> bool:
@@ -955,22 +1043,6 @@ def fetch_day(
         mx_out.append(out_row)
         historical_added += 1
 
-    write_xlsx(out_dir / f"回款记录_{day_tag}.xlsx", hk_headers, hk_out)
-
-    write_xlsx(
-        out_dir / f"订单交付_{day_tag}.xlsx",
-        ["回款记录ID", "SO", "订单已核销金额", "订单已核销金额/本币",
-         "交付额/原币", "汇率", "结算币种", "订单名称", "项目交付日期",
-         "交付日期取数状态", "单号来源"],
-        xd_out,
-    )
-    write_xlsx(
-        out_dir / f"核销明细_{day_tag}.xlsx",
-        ["核销记录NUM", "rowid", "回款记录NUM", "核销日期", "本次核销金额",
-         "本次核销金额/本币", "币种", "汇率", "SO", "订单名称", "是否已撤销"],
-        mx_out,
-    )
-
     # ── ④ 订单明细（SO → SOD + 逐 SOD 交付额）─────────────────
     sod_out: List[List[Any]] = []
     so_without_sod: List[str] = []
@@ -978,11 +1050,8 @@ def fetch_day(
         sl_ctrls = client.controls(ws_sodline)
         sl_names, sl_opts = client.name_map(sl_ctrls), client.option_maps(sl_ctrls)
         for so in all_so:
-            try:
-                hits = client.search_rows(ws_sodline, so)
-            except Exception as e:
-                print(f"WARN: 订单明细检索失败 SO={so}: {type(e).__name__}", file=sys.stderr)
-                hits = []
+            # 请求失败必须终止该日取数；只有成功响应且确实为空，才能按无 SOD 处理。
+            hits = client.search_rows(ws_sodline, so)
             n = 0
             for r in hits:
                 v = pick_named(r, sl_names, sl_opts, SODLINE_COLS)
@@ -999,12 +1068,6 @@ def fetch_day(
     elif all_so:
         print(f"WARN: 找不到「{REL_SODLINE}」表，SOD 取不到", file=sys.stderr)
         so_without_sod = list(all_so)
-
-    write_xlsx(
-        out_dir / f"订单明细_{day_tag}.xlsx",
-        ["SO", "SOD", "交付额/原币", "币种", "项目状态"],
-        sod_out,
-    )
 
     summary = {
         "day": day,
@@ -1027,18 +1090,34 @@ def fetch_day(
         "回款类型分布": type_counts,
         "无下单行的AR": ars_without_orders,
         "查不到SOD的SO": so_without_sod,
-        "files": [
-            f"回款记录_{day_tag}.xlsx",
-            f"订单交付_{day_tag}.xlsx",
-            f"核销明细_{day_tag}.xlsx",
-            f"订单明细_{day_tag}.xlsx",
-        ],
         "read_only": True,
     }
-    (out_dir / f"取数摘要_{day_tag}.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    return publish_day_exports(
+        out_dir,
+        day_tag,
+        [
+            (f"回款记录_{day_tag}.xlsx", hk_headers, hk_out),
+            (
+                f"订单交付_{day_tag}.xlsx",
+                ["回款记录ID", "SO", "订单已核销金额", "订单已核销金额/本币",
+                 "交付额/原币", "汇率", "结算币种", "订单名称", "项目交付日期",
+                 "交付日期取数状态", "单号来源"],
+                xd_out,
+            ),
+            (
+                f"核销明细_{day_tag}.xlsx",
+                ["核销记录NUM", "rowid", "回款记录NUM", "核销日期", "本次核销金额",
+                 "本次核销金额/本币", "币种", "汇率", "SO", "订单名称", "是否已撤销"],
+                mx_out,
+            ),
+            (
+                f"订单明细_{day_tag}.xlsx",
+                ["SO", "SOD", "交付额/原币", "币种", "项目状态"],
+                sod_out,
+            ),
+        ],
+        summary,
     )
-    return summary
 
 
 def already_fetched(
@@ -1077,6 +1156,13 @@ def already_fetched(
         return got if accept_unversioned else []
     if summary.get("export_schema_version") != EXPORT_SCHEMA_VERSION:
         return got if accept_unversioned else []
+    file_hashes = summary.get("file_sha256")
+    if not isinstance(file_hashes, dict):
+        return got if accept_unversioned else []
+    for name in got:
+        expected = file_hashes.get(name)
+        if not isinstance(expected, str) or _sha256(out_dir / name) != expected:
+            return got if accept_unversioned else []
     return got
 
 
@@ -1189,6 +1275,104 @@ def report_fetched_day(
         )
 
 
+def fetch_days_concurrently(
+    *,
+    base_url: str,
+    cookie: str,
+    account_id: str,
+    days: Sequence[str],
+    out_dir: Path,
+) -> List[Tuple[str, dict]]:
+    """同一登录凭据下并发取不同日期；每个日期使用独立 HTTP 会话。"""
+    ordered_days = list(days)
+    if not ordered_days:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=".batch-fetch-", dir=out_dir) as raw_staging:
+        staging_dir = Path(raw_staging)
+
+        def fetch_one(day: str) -> dict:
+            client = ZhiyunClient(base_url, cookie, account_id=account_id)
+            try:
+                return fetch_day(client, day, staging_dir)
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+
+        summaries: Dict[str, dict] = {}
+        failures: Dict[str, Exception] = {}
+        worker_count = min(MAX_BATCH_FETCH_CONCURRENCY, len(ordered_days))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="zhiyun-date",
+        ) as executor:
+            futures = {executor.submit(fetch_one, day): day for day in ordered_days}
+            for future in as_completed(futures):
+                day = futures[future]
+                try:
+                    summaries[day] = future.result()
+                except Exception as exc:  # noqa: BLE001 - 聚合所有日期的只读取数错误
+                    failures[day] = exc
+
+        if failures:
+            failed_day = next(day for day in ordered_days if day in failures)
+            failure = failures[failed_day]
+            raise FetchError(
+                f"核销日期 {failed_day} 取数失败（{type(failure).__name__}）：{failure}"
+            ) from failure
+        publish_batch_exports(staging_dir, out_dir, ordered_days, summaries)
+        return [(day, summaries[day]) for day in ordered_days]
+
+
+def publish_batch_exports(
+    staging_dir: Path,
+    out_dir: Path,
+    ordered_days: Sequence[str],
+    summaries: Dict[str, dict],
+) -> None:
+    """全部日期取数成功后统一发布；发布异常时恢复原有完整文件。"""
+    publish_entries: List[Tuple[Path, Path]] = []
+    seen_names: set[str] = set()
+    for day in ordered_days:
+        summary = summaries.get(day) or {}
+        names = summary.get("files")
+        if not isinstance(names, list) or len(names) != 4:
+            raise FetchError(f"核销日期 {day} 的取数包不完整，禁止发布。")
+        day_names = [*names, f"取数摘要_{day.replace('-', '')}.json"]
+        for name in day_names:
+            if not isinstance(name, str) or Path(name).name != name or name in seen_names:
+                raise FetchError(f"核销日期 {day} 的取数文件名无效，禁止发布。")
+            source = staging_dir / name
+            if not source.is_file():
+                raise FetchError(f"核销日期 {day} 缺少取数文件，禁止发布。")
+            seen_names.add(name)
+            publish_entries.append((source, out_dir / name))
+
+    backup_dir = staging_dir / ".previous"
+    backup_dir.mkdir(exist_ok=False)
+    promoted: List[Path] = []
+    backups: List[Tuple[Path, Path]] = []
+    try:
+        for source, target in publish_entries:
+            if target.exists():
+                backup = backup_dir / target.name
+                os.replace(target, backup)
+                backups.append((backup, target))
+            os.replace(source, target)
+            promoted.append(target)
+    except Exception as exc:  # noqa: BLE001 - 必须回滚任意文件系统发布错误
+        for target in reversed(promoted):
+            if target.exists():
+                target.unlink()
+        for backup, target in reversed(backups):
+            if backup.exists():
+                os.replace(backup, target)
+        raise FetchError("批次取数文件发布失败，原有文件已恢复。") from exc
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="智云只读取数（单入口：回款记录按核销日期 + 关联子表）"
@@ -1199,7 +1383,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     ap.add_argument("--date-from", default="", help="批量取数开始核销日期（与 --date-to 同用）")
     ap.add_argument("--date-to", default="", help="批量取数结束核销日期（与 --date-from 同用）")
-    ap.add_argument("--all-days", action="store_true", help="批量取数时包含周末；默认只取工作日")
+    date_scope = ap.add_mutually_exclusive_group()
+    date_scope.add_argument(
+        "--all-days",
+        dest="include_weekends",
+        action="store_true",
+        default=True,
+        help="批量取数时包含周末（当前默认行为，保留参数兼容旧调用）",
+    )
+    date_scope.add_argument(
+        "--workdays-only",
+        dest="include_weekends",
+        action="store_false",
+        help="批量取数时只取周一至周五",
+    )
     ap.add_argument(
         "--skip-gap-check", action="store_true",
         help="不查漏天（默认会查：有从没跑过的核销日就先报出来）",
@@ -1241,7 +1438,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             single_date=args.date,
             date_from=args.date_from,
             date_to=args.date_to,
-            include_weekends=args.all_days,
+            include_weekends=args.include_weekends,
         )
     except ValueError as exc:
         ap.error(str(exc))
@@ -1338,31 +1535,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("登录成功，开始只读取数…")
 
     try:
-        client = ZhiyunClient(args.base_url, cookie, account_id=account_id)
-        try:
-            client.controls(WS_HUIKUAN)
-        except Exception as e:
-            print(f"ERROR: 取字段失败（内网不通/无权限？）: {e}", file=sys.stderr)
-            return 2
-        for day in pending_days:
-            before_identifiers = (
-                exported_supplement_identifiers(out_dir, day)
-                if supplement_mode else {}
-            )
-            searched = (
-                search_supplement_identifiers(client, ar_ids, so_ids)
-                if supplement_mode else {}
-            )
+        if supplement_mode:
+            day = pending_days[0]
+            client = ZhiyunClient(args.base_url, cookie, account_id=account_id)
             try:
-                summary = fetch_day(client, day, out_dir, ar_ids, so_ids)
-            except Exception as exc:
-                print(
-                    f"ERROR: 核销日期 {day} 取数失败（{type(exc).__name__}）：{exc}",
-                    file=sys.stderr,
-                )
-                return 2
-            supplement_result = None
-            if supplement_mode:
+                before_identifiers = exported_supplement_identifiers(out_dir, day)
+                searched = search_supplement_identifiers(client, ar_ids, so_ids)
+                try:
+                    summary = fetch_day(client, day, out_dir, ar_ids, so_ids)
+                except Exception as exc:
+                    print(
+                        f"ERROR: 核销日期 {day} 取数失败（{type(exc).__name__}）：{exc}",
+                        file=sys.stderr,
+                    )
+                    return 2
                 after_identifiers = exported_supplement_identifiers(out_dir, day)
                 supplement_result = build_supplement_result(
                     ar_ids,
@@ -1371,7 +1557,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                     after=after_identifiers,
                     searched=searched,
                 )
-            report_fetched_day(day, out_dir, summary, supplement_result)
+                report_fetched_day(day, out_dir, summary, supplement_result)
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        else:
+            try:
+                fetched_days = fetch_days_concurrently(
+                    base_url=args.base_url,
+                    cookie=cookie,
+                    account_id=account_id,
+                    days=pending_days,
+                    out_dir=out_dir,
+                )
+            except FetchError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+            # 日志和跑批台账按核销日期登记，后续业务流程也继续按此顺序串行。
+            for day, summary in fetched_days:
+                report_fetched_day(day, out_dir, summary)
     finally:
         cookie = ""
         del cookie
